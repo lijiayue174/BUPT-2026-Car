@@ -1,0 +1,33 @@
+# Keil build output
+Objects/
+Listings/
+
+# Keil generated files
+*.axf
+*.hex
+*.map
+*.lst
+*.lst
+*.o
+*.d
+*.crf
+*.htm
+*.lnp
+*.dep
+*.bak
+
+# Keil user/local settings
+*.uvguix.*
+*.uvoptx
+*.scvd
+
+# Temporary files
+*.tmp
+*.log
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Claude local settings
+.claude/settings.local.json

@@ -33,8 +33,8 @@
 | **PB12** | 灰度 D8 | GPIO IN (上拉) | `xunji.c` |
 | **PA8** | IMU JY61P UART1 TX | UART1 | `IMU.c` |
 | **PA9** | IMU JY61P UART1 RX | UART1 | `IMU.c` |
-| **PB2** | OLED SDA (I2C) | Software I2C | `ml_i2c.c` |
-| **PB3** | OLED SCL (I2C) | Software I2C | `ml_i2c.c` |
+| **PB2** | OLED SCL (I2C) | Software I2C | `ml_oled.c` |
+| **PB3** | OLED SDA (I2C) | Software I2C | `ml_oled.c` |
 | **PB8** | 蜂鸣器 | GPIO OUT | `buzzer_light.c` |
 | **PB26** | LED | GPIO OUT | `buzzer_light.c` |
 | **PA0/PA1** | HFXT 晶振 | Analog | `ti_msp_dl_config.c` |

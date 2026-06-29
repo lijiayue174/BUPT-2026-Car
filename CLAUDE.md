@@ -200,7 +200,7 @@ pid_init(&motorB, DELTA_PID,    10,      10, 5);       // right wheel speed
 | Right encoder A/B | PA24 (RISING EXTI) / PA15 (FALLING EXTI) |
 | Grayscale D1–D8 | PB13 / PB15 / PA31 / PA28 / PB1 / PB4 / PB17 / PB12 |
 | IMU (JY61P) UART1 | PA8 (TX) / PA9 (RX), 9600 baud |
-| OLED I2C | PB2 (SDA) / PB3 (SCL) |
+| OLED I2C | PB2 (SCL) / PB3 (SDA) |
 | Buzzer | PB8 (active HIGH, auto-off via TIMG7) |
 | LED | PB26 (active HIGH, auto-off via TIMG7) |
 | Button 1 (mode) | PA17 (EXTI + polling) |

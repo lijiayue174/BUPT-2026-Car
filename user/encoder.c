@@ -108,7 +108,7 @@ void GROUP1_IRQHandler(void)//Group1的中断服务函数
          delay_ms(10);
 			   mode++;
 			   set=0;
-			   if(mode==5)
+			   if(mode==7)
 		    {
 			     mode=1;
 			  }

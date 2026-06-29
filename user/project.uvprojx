@@ -474,6 +474,16 @@
               <FileType>5</FileType>
               <FilePath>.\key.h</FilePath>
             </File>
+            <File>
+              <FileName>mission.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\mission.c</FilePath>
+            </File>
+            <File>
+              <FileName>gimbal.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\gimbal.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

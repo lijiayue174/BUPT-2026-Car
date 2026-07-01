@@ -6,7 +6,7 @@ extern int set;
 void key_init()
 {
    set=0;
-	 mode=0;
+	 mode=1;
 	 gpio_init(GPIOA, DL_GPIO_PIN_17, PA17, IN_UP); 
 	 gpio_init(GPIOA, DL_GPIO_PIN_27, PA27, IN_UP); 
 }

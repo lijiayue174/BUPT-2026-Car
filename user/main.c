@@ -58,24 +58,35 @@ int main(void)
 			 if (mode==5) mission_reset();   /* ??:???????????? */
 		 }
 			
-			OLED_ShowString(1, 1, "mode:");
-			OLED_ShowString(2, 1, "set:");
-			OLED_ShowString(3, 1, "yaw:");
-			OLED_ShowNum(1, 6, mode,3);
-			OLED_ShowNum(2, 6, set,1);
-		  OLED_ShowSignedNum(3, 6, yaw_angle_int,3);
+		  /* 第1行: M:X S:X */
+		  OLED_ShowString(1, 1, "M:");
+		  OLED_ShowNum(1, 3, mode, 1);
+		  OLED_ShowString(1, 5, "S:");
+		  OLED_ShowNum(1, 7, set, 1);
+
+		  /* 第2行: G:D1D2D3D4D5D6D7D8 */
+		  {
+		      uint8_t gi;
+		      OLED_ShowString(2, 1, "G:");
+		      for (gi = 1; gi <= 8; gi++) {
+		          OLED_ShowNum(2, (uint8_t)(2 + gi), digtal(gi), 1);
+		      }
+		  }
+
+		  /* 第3行: yaw */
+		  OLED_ShowString(3, 1, "yaw:");
+		  OLED_ShowSignedNum(3, 5, yaw_angle_int, 4);
+
+		  /* 第4行: 编码器调试 / 任务状态 */
 		  if (mode==5) {
-            OLED_ShowString(4, 1, "st:");
-            OLED_ShowNum(4, 6, (int)mission_state, 1);
-        } else {
-            /* 第4行显示 8 路灰度: G:D1D2D3D4D5D6D7D8 */
-            uint8_t gi;
-            OLED_ShowString(4, 1, "G:");
-            for (gi = 1; gi <= 8; gi++) {
-                OLED_ShowNum(4, (uint8_t)(2 + gi), digtal(gi), 1);
-            }
-        }
-		  
+              OLED_ShowString(4, 1, "st:");
+              OLED_ShowNum(4, 4, (int)mission_state, 1);
+          } else {
+              OLED_ShowString(4, 1, "L:");
+              OLED_ShowSignedNum(4, 3, left_encoder, 4);
+              OLED_ShowString(4, 8, "R:");
+              OLED_ShowSignedNum(4, 10, right_encoder, 4);
+          }
    }
 }
 

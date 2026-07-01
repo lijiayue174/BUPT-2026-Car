@@ -3,6 +3,20 @@
 uint8_t motorA_dir=1;   //1为正转 0为反转
 uint8_t motorB_dir=1;
 
+#define MOTOR_START_PWM 2500
+
+static int motor_effective_pwm(int pwm)
+{
+	if(pwm > 0 && pwm < MOTOR_START_PWM)
+	{
+		return MOTOR_START_PWM;
+	}
+	if(pwm < 0 && pwm > -MOTOR_START_PWM)
+	{
+		return -MOTOR_START_PWM;
+	}
+	return pwm;
+}
 
 void motor_init()    //初始化
 {
@@ -22,6 +36,7 @@ void motor_init()    //初始化
 
 void Set_left_pwm(int pwm)
 {
+	  pwm = motor_effective_pwm(pwm);
 	  if(pwm>0)
 	  {
 		gpio_set(GPIOB,DL_GPIO_PIN_24,1);
@@ -43,6 +58,7 @@ void Set_left_pwm(int pwm)
 
 void Set_right_pwm(int pwm)
 {
+	pwm = motor_effective_pwm(pwm);
 	if(pwm>0)
 	{
 		gpio_set(GPIOB,DL_GPIO_PIN_19,1);

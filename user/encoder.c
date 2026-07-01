@@ -1,7 +1,7 @@
 #include "headfile.h"
 
-int Encoder_count1=0;
-int Encoder_count2=0;
+volatile int Encoder_count1=0;
+volatile int Encoder_count2=0;
 
 int mode,set;
 
@@ -103,26 +103,14 @@ void GROUP1_IRQHandler(void)//Group1的中断服务函数
 			GPIOA->CPU_INT.ICLR |= DL_GPIO_PIN_15; // 清除中断标志位
 		}
 		
-			 if(GPIOA->CPU_INT.MIS & DL_GPIO_PIN_17) // PA14外部中断
+		 if(GPIOA->CPU_INT.MIS & DL_GPIO_PIN_17) // PA17按键由主循环轮询处理
 		 {
-         delay_ms(10);
-			   mode++;
-			   set=0;
-			   if(mode==7)
-		    {
-			     mode=1;
-			  }
-		  
-			GPIOA->CPU_INT.ICLR |= DL_GPIO_PIN_17; // 清除中断标志位
+			GPIOA->CPU_INT.ICLR |= DL_GPIO_PIN_17;
 		}
 		
-		  if(GPIOA->CPU_INT.MIS & DL_GPIO_PIN_27) // PA14外部中断
+		  if(GPIOA->CPU_INT.MIS & DL_GPIO_PIN_27) // PA27按键由主循环轮询处理
 		{
-			delay_ms(10);
-			if(set==0)
-        set=1;
-			else set=0;
-			GPIOA->CPU_INT.ICLR |= DL_GPIO_PIN_27; // 清除中断标志位
+			GPIOA->CPU_INT.ICLR |= DL_GPIO_PIN_27;
 		}
 }
 

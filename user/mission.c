@@ -12,6 +12,20 @@
  *  借鉴：25E 加权偏差/串级/里程；24H 混合策略/发车保护/入弯保护。详见 mission.h。
  * ========================================================================== */
 
+/* ===================== 灰度通道映射层 ===================== */
+/* 映射表：gray_map[逻辑通道-1] = 物理通道
+ * 当前配置（整条反转）：逻辑 D1~D8 = 物理 D8~D1
+ * 如需恢复正装：改为 {1,2,3,4,5,6,7,8} */
+static const uint8_t mission_gray_map[8] = {8, 7, 6, 5, 4, 3, 2, 1};
+
+int mission_gray_mapped(int logic_idx)
+{
+    /* logic_idx: 1~8（逻辑通道，从左到右）
+     * 返回：对应物理通道的灰度值（0=黑线, 1=白底） */
+    if (logic_idx < 1 || logic_idx > 8) return 1;  /* 越界保护，返回白底 */
+    return digtal(mission_gray_map[logic_idx - 1]);
+}
+
 /* ===================== 全局/调试量 ===================== */
 task_state_t mission_state  = TASK_IDLE;
 float   mission_dist     = 0.0f;
@@ -41,9 +55,13 @@ static const float kW[8] = {
 static void mission_gray_update(void)
 {
     uint8_t bd = 0x00;
-    /* digtal(i)=0 黑/压线, =1 白；25E BinaryData 同极性：bit=1 白。 */
-    for (int i = 0; i < 8; i++)
-        if (digtal((unsigned char)(i + 1))) bd |= (uint8_t)(1u << i);
+    int i;
+    float sum;
+    int cnt;
+
+    /* 使用映射后的灰度顺序读取（逻辑 D1~D8） */
+    for (i = 0; i < 8; i++)
+        if (mission_gray_mapped(i + 1)) bd |= (uint8_t)(1u << i);
     mission_gray_bd = bd;
 
     /* 丢线置信计数（24H GraySensorNoData）：持续全白/全黑则升，见到线则减半 */
@@ -51,8 +69,9 @@ static void mission_gray_update(void)
     else if (mission_nodata != 0x00)                          mission_nodata >>= 1;
 
     /* 加权偏差：对所有"压线"的传感器(bit=0)求权重均值，再 *增益 */
-    float sum = 0.0f; int cnt = 0;
-    for (int i = 0; i < 8; i++)
+    sum = 0.0f;
+    cnt = 0;
+    for (i = 0; i < 8; i++)
         if (!(bd & (1u << i))) { sum += kW[i]; cnt++; }
 
     if (cnt == 0) {

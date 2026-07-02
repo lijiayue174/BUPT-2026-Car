@@ -96,14 +96,26 @@ static void oled_debug_update(void)
 #define MOTOR_TEST_RIGHT_DIR       1      /* 右轮方向，反了改成 -1 */
 
 /* ==================== 低速循迹测试参数（阶段4专用） ==================== */
-#define LINE_TEST_PWM_BASE         2400   /* 循迹基础速度（略高于起转阈值） */
-#define LINE_TEST_TURN_GAIN        80     /* 转向增益，偏差->差速的放大系数 */
-#define LINE_TEST_TURN_MAX         500    /* 最大差速限幅，防止一边突然太快 */
-#define LINE_TEST_BIAS_SIGN        1      /* 偏差符号，反向改成 -1 */
+#define LINE_TEST_PWM_BASE          2200   /* low-speed line base PWM; if motor stalls, try 2300/2400 on site */
+#define LINE_TEST_PWM_MIN           0
+#define LINE_TEST_PWM_MAX           3600
+#define LINE_TEST_TURN_GAIN         160    /* bias -> differential PWM gain */
+#define LINE_TEST_RIGHT_TURN_GAIN   420    /* stronger gain when bias < 0, for clockwise/right curves */
+#define LINE_TEST_RIGHT_TURN_OFFSET 500    /* right-turn preload once line moves to the right side */
+#define LINE_TEST_RIGHT_TURN_EXTRA  300    /* extra right turn when abs(bias) >= 0.5 */
+#define LINE_TEST_TURN_MAX          1800   /* max differential PWM */
+#define LINE_TEST_CURVE_SLOW_GAIN   80     /* larger bias -> lower dynamic base */
+#define LINE_TEST_RIGHT_SLOW_GAIN   140    /* stronger slowing when bias < 0 */
+#define LINE_TEST_PWM_BASE_MIN      1600   /* minimum moving base while line is visible */
+#define LINE_TEST_RIGHT_BASE_MIN    1200   /* allow lower base in 40cm clockwise/right curves */
+#define LINE_TEST_BIAS_SIGN         1      /* reverse to -1 if steering direction is wrong */
+#define LINE_TEST_LOST_SHORT_COUNT  20     /* 20 * 10ms: keep searching shortly after line loss */
+#define LINE_TEST_LOST_PWM_BASE     1600   /* slow search base after short line loss */
 
 /* ==================== 测试状态变量（需在函数前声明） ==================== */
 static int motor_test_tick = 0;           /* 电机测试计数器 */
-static float line_last_bias = 0.0f;       /* 上一帧循迹偏差 */
+static int line_last_turn = 0;            /* last valid turn PWM for short line-loss recovery */
+static int line_lost_count = 0;           /* continuous all-white sample count */
 
 /* 灰度加权权重表（D1~D8，从左到右） */
 static const float kLineWeight[8] = {
@@ -161,12 +173,12 @@ static void motor_output_both(int left_pwm, int right_pwm)
 static void car_stop_all(void)
 {
     /* 立即停止电机 */
-    Set_left_pwm(0);
-    Set_right_pwm(0);
+    motor_output_both(0, 0);
 
     /* 清空 mode6 临时测试状态 */
     motor_test_tick = 0;
-    line_last_bias = 0.0f;
+    line_last_turn = 0;
+    line_lost_count = 0;
 
     /* mission 状态解除（mode5 专用，其他 mode 调用无害） */
     mission_disarm();
@@ -234,7 +246,16 @@ static void motor_suspended_test(void)
 static void motor_test_reset(void)
 {
     motor_test_tick = 0;
+    line_last_turn = 0;
+    line_lost_count = 0;
     motor_output_both(0, 0);
+}
+
+static int line_test_limit_pwm(int pwm)
+{
+    if (pwm > LINE_TEST_PWM_MAX) return LINE_TEST_PWM_MAX;
+    if (pwm < LINE_TEST_PWM_MIN) return LINE_TEST_PWM_MIN;
+    return pwm;
 }
 
 /* ============================================================================
@@ -258,8 +279,9 @@ static void motor_test_reset(void)
 static void line_follow_test_run(void)
 {
     uint8_t gray[8];
-    int i, black_cnt, turn, left_pwm, right_pwm;
-    float sum, bias;
+    int i, black_cnt, turn, abs_bias_x10, dynamic_base, base_min, left_pwm, right_pwm;
+    int turn_gain, slow_gain;
+    float sum, bias, abs_bias;
 
     black_cnt = 0;
     sum = 0.0f;
@@ -280,23 +302,75 @@ static void line_follow_test_run(void)
 
     /* 3. 判断是否有线 */
     if (black_cnt == 0) {
-        /* 全白丢线：停车，避免冲出赛道（保守策略） */
+        line_lost_count++;
+        if (line_lost_count < LINE_TEST_LOST_SHORT_COUNT) {
+            /* Short line loss: keep the last turn at low speed to search the line. */
+            turn = line_last_turn;
+            left_pwm  = LINE_TEST_LOST_PWM_BASE - turn;
+            right_pwm = LINE_TEST_LOST_PWM_BASE + turn;
+            left_pwm  = line_test_limit_pwm(left_pwm);
+            right_pwm = line_test_limit_pwm(right_pwm);
+            motor_output_both(left_pwm, right_pwm);
+            return;
+        }
+
+        /* Long line loss: stop instead of driving straight out of the track. */
         motor_output_both(0, 0);
         return;
     } else {
-        /* 有线：计算平均偏差 */
-        bias = LINE_TEST_BIAS_SIGN * (sum / (float)black_cnt);
-        line_last_bias = bias;  /* 记录有效偏差 */
+        line_lost_count = 0;
     }
 
-    /* 4. 根据偏差计算转向差速 */
-    turn = (int)(bias * LINE_TEST_TURN_GAIN);
+    /*
+     * bias is the average weight of black-line sensors only.
+     * D1..D8 weights: +3, +1.5, +0.5, +0.1, -0.1, -0.5, -1.5, -3.
+     * LINE_TEST_BIAS_SIGN only changes steering polarity; gray_mapped() still
+     * keeps logical D1..D8 from left to right, black=0 and white=1.
+     */
+    bias = LINE_TEST_BIAS_SIGN * (sum / (float)black_cnt);
+    abs_bias = (bias < 0.0f) ? -bias : bias;
+    abs_bias_x10 = (int)(abs_bias * 10.0f + 0.5f);
+
+    /*
+     * turn is differential PWM. Larger bias makes larger differential speed and
+     * also lowers dynamic_base, so sharp curves slow down and the inner wheel
+     * may fall to 0 instead of being lifted to a start threshold.
+     *
+     * On this car, clockwise/right curves are weaker. The 40cm contest arc
+     * needs earlier correction, so bias < 0 uses a preload offset instead of
+     * waiting for D7/D8 to create a large averaged bias.
+     */
+    if (bias < 0.0f) {
+        turn_gain = LINE_TEST_RIGHT_TURN_GAIN;
+        slow_gain = LINE_TEST_RIGHT_SLOW_GAIN;
+        base_min = LINE_TEST_RIGHT_BASE_MIN;
+    } else {
+        turn_gain = LINE_TEST_TURN_GAIN;
+        slow_gain = LINE_TEST_CURVE_SLOW_GAIN;
+        base_min = LINE_TEST_PWM_BASE_MIN;
+    }
+
+    turn = (int)(bias * turn_gain);
+    if (bias < 0.0f) {
+        turn -= LINE_TEST_RIGHT_TURN_OFFSET;
+        if (abs_bias_x10 >= 5) {
+            turn -= LINE_TEST_RIGHT_TURN_EXTRA;
+        }
+    }
     if (turn > LINE_TEST_TURN_MAX)  turn = LINE_TEST_TURN_MAX;
     if (turn < -LINE_TEST_TURN_MAX) turn = -LINE_TEST_TURN_MAX;
+    line_last_turn = turn;
 
-    /* 5. 计算左右轮 PWM（base - turn, base + turn） */
-    left_pwm  = LINE_TEST_PWM_BASE - turn;
-    right_pwm = LINE_TEST_PWM_BASE + turn;
+    dynamic_base = LINE_TEST_PWM_BASE - abs_bias_x10 * slow_gain / 10;
+    if (dynamic_base < base_min) {
+        dynamic_base = base_min;
+    }
+
+    /* 5. 计算左右轮 PWM（dynamic_base - turn, dynamic_base + turn） */
+    left_pwm  = dynamic_base - turn;
+    right_pwm = dynamic_base + turn;
+    left_pwm  = line_test_limit_pwm(left_pwm);
+    right_pwm = line_test_limit_pwm(right_pwm);
 
     /* 6. 输出到电机（自动应用阶段3校准的方向和补偿） */
     motor_output_both(left_pwm, right_pwm);

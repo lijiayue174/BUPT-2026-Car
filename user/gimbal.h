@@ -34,8 +34,8 @@
 #define GIMBAL_YAW_CH        DL_TIMER_CC_0_INDEX      /* PA14 / TIMG12_CCP0 */
 
 #define GIMBAL_PITCH_ENABLE  1
-#define GIMBAL_PITCH_TIMER   TIMA1                    /* PA16 / TIMA1_CCP1 */
-#define GIMBAL_PITCH_CH      DL_TIMER_CC_1_INDEX
+#define GIMBAL_PITCH_SOFT_PWM 1                       /* PA16 GPIO software PWM */
+/* Current strategy: PA16 pitch uses GPIO software PWM, not TIMA1 hardware PWM. */
 
 /* ---- PWM 频率与脉宽常量（单位 us） ---- */
 #define GIMBAL_PWM_FREQ      50                       /* 标准舵机 50Hz / 20ms */
@@ -70,6 +70,7 @@ void gimbal_init(void);                              /* 初始化 PWM，并回�
 void gimbal_set_pulse_us(uint16_t yaw_us, uint16_t pitch_us);  /* 直接给两个舵机脉宽（带限幅） */
 void gimbal_set_yaw_us(uint16_t yaw_us);             /* 只给 yaw */
 void gimbal_set_pitch_us(uint16_t pitch_us);         /* 只给 pitch */
+void gimbal_pitch_soft_pwm_service(void);            /* PA16 software PWM, one 20ms frame */
 void gimbal_center(void);                            /* 回中位 */
 void gimbal_aim_B(void);                             /* 瞄准 B 点固定姿态（标定后用） */
 

@@ -118,6 +118,8 @@ static int motor_test_tick = 0;           /* 电机测试计数器 */
 static int line_last_turn = 0;            /* last valid turn PWM for short line-loss recovery */
 static int line_lost_count = 0;           /* continuous all-white sample count */
 static int line_last_black_cnt = 0;       /* last sample black sensor count, for mode2 task1 only */
+static int mode7_diag_tick = 0;           /* mode7 hardware diag tick, 10ms per tick */
+static uint8_t mode7_led_state = 0;
 
 /* ==================== mode2: 校赛任务一，顺时针 A-B-C-D-A ==================== */
 #define TASK1_COUNT_TO_DIST       0.20f   /* same odom scale as mission.c, tune on site if distance is off */
@@ -159,6 +161,32 @@ static void task1_clear_state(void)
     task1_arc_done_count = 0;
     task1_arc_seen_line = 0;
     task1_finished = 0;
+}
+
+static void mode7_diag_reset(void)
+{
+    mode7_diag_tick = 0;
+    mode7_led_state = 0;
+    gpio_set(GPIOB, DL_GPIO_PIN_8, 1);    /* buzzer off */
+    gpio_set(GPIOB, DL_GPIO_PIN_26, 0);   /* LED default off */
+}
+
+static void mode7_diag_run(void)
+{
+    mode7_diag_tick++;
+
+    /* PB8 buzzer stays off in the current mode7 gimbal-only test. */
+    gpio_set(GPIOB, DL_GPIO_PIN_8, 1);
+
+    /* LED toggles about every 120ms, roughly 4Hz blink, to prove mode7 PWM is active. */
+    if ((mode7_diag_tick % 12) == 0) {
+        mode7_led_state = (uint8_t)!mode7_led_state;
+        gpio_set(GPIOB, DL_GPIO_PIN_26, mode7_led_state ? 1 : 0);
+    }
+
+    if (mode7_diag_tick >= 1200) {
+        mode7_diag_tick = 0;
+    }
 }
 
 /* 灰度加权权重表（D1~D8，从左到右） */
@@ -620,7 +648,10 @@ int main(void)
        /* mode 切换时强制停止 */
        set=0;
        car_stop_all();  /* 立即停止电机，清空状态 */
-       if (mode==7) gimbal_center();  /* mode7: 云台独立测试，切入时先回安全中位 */
+       if (mode==7) {
+           mode7_diag_reset();
+           gimbal_center();  /* mode7: 云台独立测试，切入时先回安全中位 */
+       }
 		 }
 
 		  /* ===== PA27 set 键：启停切换 ===== */
@@ -634,15 +665,27 @@ int main(void)
 			     if (mode==6) motor_test_reset(); /* mode6: 复位电机测试计数器 */
 			     if (mode==7) {
 			         car_stop_all();   /* mode7: 启动云台测试前确保电机无残留 PWM */
+			         mode7_diag_reset();
 			         gimbal_center();  /* 从中位开始安全扫动 */
 			     }
 			 } else {
 			     /* 当前运行 -> 停止 */
 			     set = 0;
 			     car_stop_all();  /* 立即停止电机，清空状态 */
-			     if (mode==7) gimbal_center();  /* mode7: 停止时云台回安全中位 */
+			     if (mode==7) {
+			         mode7_diag_reset();
+			         gimbal_center();  /* mode7: 停止时云台回安全中位 */
+			     }
 			 }
 		 }
+
+          /*
+           * PA16 pitch uses software PWM. Run one 20ms frame only while the car
+           * is stopped in mode7 gimbal test; never block inside TIMG8 ISR.
+           */
+          if (mode==7 && set==1) {
+              gimbal_pitch_soft_pwm_service();
+          }
 
 		  /* 统一调试显示（所有 mode 1~7 格式一致，不随 mode 变化） */
 		  oled_debug_update();
@@ -689,12 +732,14 @@ void TIMG8_IRQHandler()
           motor_output_both(0, 0);
         }
 
-        /* mode 7 云台独立安全测试：不跑车、不循迹、不进 mission，电机始终停止 */
+        /* mode 7 硬件诊断：不跑车、不循迹、不进 mission，电机始终停止 */
         if(mode==7 && set==1) {
           car_stop_all();
+          mode7_diag_run();
           gimbal_test_sweep_safe();
         } else if(mode==7 && set==0) {
           car_stop_all();
+          mode7_diag_reset();
           gimbal_center();
         }
 

@@ -3,6 +3,7 @@
 #include "key.h"
 #include "gimbal.h"      /* ?? */
 #include "mission.h"     /* ?? */
+#include "buzzer_light.h"
 int left_pwm,right_pwm,left_angle_pwm,right_angle_pwm;
 int base_left_pwm,base_right_pwm,angle_pwm,angle_pwm1;
 int cur_state,last_state,pre_state;
@@ -116,6 +117,49 @@ static void oled_debug_update(void)
 static int motor_test_tick = 0;           /* 电机测试计数器 */
 static int line_last_turn = 0;            /* last valid turn PWM for short line-loss recovery */
 static int line_lost_count = 0;           /* continuous all-white sample count */
+static int line_last_black_cnt = 0;       /* last sample black sensor count, for mode2 task1 only */
+
+/* ==================== mode2: 校赛任务一，顺时针 A-B-C-D-A ==================== */
+#define TASK1_COUNT_TO_DIST       0.20f   /* same odom scale as mission.c, tune on site if distance is off */
+#define TASK1_STRAIGHT_DIST_MM    1000.0f /* A-B and C-D straight section, 100cm */
+#define TASK1_STRAIGHT_LEFT_PWM   1100    /* straight-only trim: lower left to reduce right drift */
+#define TASK1_STRAIGHT_RIGHT_PWM  1850
+#define TASK1_STRAIGHT_BALANCE_GAIN 0.0f  /* 0 disables encoder balance while tuning straight PWM */
+#define TASK1_STRAIGHT_BALANCE_MAX  900
+#define TASK1_STRAIGHT_BLACK_MIN_TICKS 30 /* allow black-line handoff after 0.3s straight */
+#define TASK1_ARC_MIN_TICKS       80      /* ignore line loss at arc entry for 0.8s */
+#define TASK1_ARC_LOST_TICKS      25      /* 0.25s all-white after arc means arc finished */
+
+typedef enum {
+    TASK1_AB_STRAIGHT = 0,
+    TASK1_BC_ARC,
+    TASK1_CD_STRAIGHT,
+    TASK1_DA_ARC,
+    TASK1_DONE
+} task1_phase_t;
+
+static task1_phase_t task1_phase = TASK1_AB_STRAIGHT;
+static float task1_dist = 0.0f;
+static float task1_left_dist = 0.0f;
+static float task1_right_dist = 0.0f;
+static int task1_phase_ticks = 0;
+static int task1_arc_lost_ticks = 0;
+static int task1_arc_done_count = 0;
+static uint8_t task1_arc_seen_line = 0;
+static uint8_t task1_finished = 0;
+
+static void task1_clear_state(void)
+{
+    task1_phase = TASK1_AB_STRAIGHT;
+    task1_dist = 0.0f;
+    task1_left_dist = 0.0f;
+    task1_right_dist = 0.0f;
+    task1_phase_ticks = 0;
+    task1_arc_lost_ticks = 0;
+    task1_arc_done_count = 0;
+    task1_arc_seen_line = 0;
+    task1_finished = 0;
+}
 
 /* 灰度加权权重表（D1~D8，从左到右） */
 static const float kLineWeight[8] = {
@@ -179,6 +223,8 @@ static void car_stop_all(void)
     motor_test_tick = 0;
     line_last_turn = 0;
     line_lost_count = 0;
+    line_last_black_cnt = 0;
+    task1_clear_state();
 
     /* mission 状态解除（mode5 专用，其他 mode 调用无害） */
     mission_disarm();
@@ -248,7 +294,16 @@ static void motor_test_reset(void)
     motor_test_tick = 0;
     line_last_turn = 0;
     line_lost_count = 0;
+    line_last_black_cnt = 0;
     motor_output_both(0, 0);
+}
+
+static int task1_sample_black_count(void);
+
+static void task1_reset(void)
+{
+    motor_test_reset();
+    task1_clear_state();
 }
 
 static int line_test_limit_pwm(int pwm)
@@ -299,6 +354,7 @@ static void line_follow_test_run(void)
             black_cnt++;
         }
     }
+    line_last_black_cnt = black_cnt;
 
     /* 3. 判断是否有线 */
     if (black_cnt == 0) {
@@ -376,6 +432,148 @@ static void line_follow_test_run(void)
     motor_output_both(left_pwm, right_pwm);
 }
 
+static int task1_sample_black_count(void)
+{
+    int i, black_cnt;
+
+    black_cnt = 0;
+    for (i = 1; i <= 8; i++) {
+        if (gray_mapped(i) == 0) {
+            black_cnt++;
+        }
+    }
+    line_last_black_cnt = black_cnt;
+    return black_cnt;
+}
+
+static void task1_odom_update(void)
+{
+    float left_d, right_d, d;
+
+    left_d = (float)left_encoder * TASK1_COUNT_TO_DIST;
+    right_d = (float)right_encoder * TASK1_COUNT_TO_DIST;
+    if (left_d > 0.0f) {
+        task1_left_dist += left_d;
+    }
+    if (right_d > 0.0f) {
+        task1_right_dist += right_d;
+    }
+
+    d = (left_d + right_d) * 0.5f;
+    if (d > 0.0f) {
+        task1_dist += d;
+    }
+}
+
+static void task1_next_phase(task1_phase_t next_phase)
+{
+    task1_phase = next_phase;
+    task1_dist = 0.0f;
+    task1_left_dist = 0.0f;
+    task1_right_dist = 0.0f;
+    task1_phase_ticks = 0;
+    task1_arc_lost_ticks = 0;
+    task1_arc_seen_line = 0;
+    line_lost_count = 0;
+}
+
+static void task1_finish(void)
+{
+    task1_finished = 1;
+    task1_phase = TASK1_DONE;
+    set = 0;
+    motor_output_both(0, 0);
+    beep();
+}
+
+static void task1_drive_straight(void)
+{
+    int balance;
+
+    balance = (int)((task1_left_dist - task1_right_dist) * TASK1_STRAIGHT_BALANCE_GAIN);
+    if (balance > TASK1_STRAIGHT_BALANCE_MAX) {
+        balance = TASK1_STRAIGHT_BALANCE_MAX;
+    }
+    if (balance < -TASK1_STRAIGHT_BALANCE_MAX) {
+        balance = -TASK1_STRAIGHT_BALANCE_MAX;
+    }
+
+    motor_output_both(TASK1_STRAIGHT_LEFT_PWM - balance,
+                      TASK1_STRAIGHT_RIGHT_PWM + balance);
+}
+
+static void task1_run_arc(task1_phase_t next_phase)
+{
+    if (!task1_arc_seen_line) {
+        if (task1_sample_black_count() == 0) {
+            task1_drive_straight();
+            return;
+        }
+        task1_arc_seen_line = 1;
+        line_lost_count = 0;
+    }
+
+    line_follow_test_run();
+    task1_phase_ticks++;
+
+    if (task1_arc_seen_line && line_last_black_cnt == 0 && task1_phase_ticks > TASK1_ARC_MIN_TICKS) {
+        task1_arc_lost_ticks++;
+    } else {
+        task1_arc_lost_ticks = 0;
+    }
+
+    if (task1_arc_lost_ticks >= TASK1_ARC_LOST_TICKS) {
+        task1_arc_done_count++;
+        if (task1_arc_done_count >= 2) {
+            task1_finish();
+        } else {
+            task1_next_phase(next_phase);
+        }
+    }
+}
+
+static void task1_run_once(void)
+{
+    if (task1_finished) {
+        motor_output_both(0, 0);
+        return;
+    }
+
+    task1_odom_update();
+
+    switch (task1_phase) {
+    case TASK1_AB_STRAIGHT:
+        task1_phase_ticks++;
+        task1_drive_straight();
+        if ((task1_sample_black_count() > 0 && task1_phase_ticks >= TASK1_STRAIGHT_BLACK_MIN_TICKS) ||
+            task1_dist >= TASK1_STRAIGHT_DIST_MM) {
+            task1_next_phase(TASK1_BC_ARC);
+        }
+        break;
+
+    case TASK1_BC_ARC:
+        task1_run_arc(TASK1_CD_STRAIGHT);
+        break;
+
+    case TASK1_CD_STRAIGHT:
+        task1_phase_ticks++;
+        task1_drive_straight();
+        if ((task1_sample_black_count() > 0 && task1_phase_ticks >= TASK1_STRAIGHT_BLACK_MIN_TICKS) ||
+            task1_dist >= TASK1_STRAIGHT_DIST_MM) {
+            task1_next_phase(TASK1_DA_ARC);
+        }
+        break;
+
+    case TASK1_DA_ARC:
+        task1_run_arc(TASK1_DONE);
+        break;
+
+    default:
+        task1_finish();
+        break;
+    }
+}
+
 /* ============================================================================
  *  main() 和 TIMG8 ISR
  * ========================================================================== */
@@ -431,6 +629,7 @@ int main(void)
 			 if (set == 0) {
 			     /* 当前停止 -> 启动 */
 			     set = 1;
+			     if (mode==2) task1_reset();     /* mode2: 校赛任务一，一圈后自动停车 */
 			     if (mode==5) mission_reset();   /* mode5: 复位任务状态机 */
 			     if (mode==6) motor_test_reset(); /* mode6: 复位电机测试计数器 */
 			     if (mode==7) {
@@ -463,7 +662,7 @@ void TIMG8_IRQHandler()
 		   }
 			 	if(mode==2&&set==1)
 		   {
-          track2();
+          task1_run_once();
 		   }
 			 	if(mode==3&&set==1)
 		   {

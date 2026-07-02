@@ -416,12 +416,13 @@ int main(void)
 		  if (KeyNum == 1)
 		 {
 		   mode++;
-       if(mode==7)
+       if(mode>7)
 			 {mode=1;}
 
        /* mode 切换时强制停止 */
        set=0;
        car_stop_all();  /* 立即停止电机，清空状态 */
+       if (mode==7) gimbal_center();  /* mode7: 云台独立测试，切入时先回安全中位 */
 		 }
 
 		  /* ===== PA27 set 键：启停切换 ===== */
@@ -432,14 +433,19 @@ int main(void)
 			     set = 1;
 			     if (mode==5) mission_reset();   /* mode5: 复位任务状态机 */
 			     if (mode==6) motor_test_reset(); /* mode6: 复位电机测试计数器 */
+			     if (mode==7) {
+			         car_stop_all();   /* mode7: 启动云台测试前确保电机无残留 PWM */
+			         gimbal_center();  /* 从中位开始安全扫动 */
+			     }
 			 } else {
 			     /* 当前运行 -> 停止 */
 			     set = 0;
 			     car_stop_all();  /* 立即停止电机，清空状态 */
+			     if (mode==7) gimbal_center();  /* mode7: 停止时云台回安全中位 */
 			 }
 		 }
 
-		  /* 统一调试显示（所有 mode 1~6 格式一致，不随 mode 变化） */
+		  /* 统一调试显示（所有 mode 1~7 格式一致，不随 mode 变化） */
 		  oled_debug_update();
    }
 }
@@ -482,6 +488,15 @@ void TIMG8_IRQHandler()
         } else if(mode==6 && set==0) {
           /* mode 6 且 set=0 时，主动停止电机（安全保护） */
           motor_output_both(0, 0);
+        }
+
+        /* mode 7 云台独立安全测试：不跑车、不循迹、不进 mission，电机始终停止 */
+        if(mode==7 && set==1) {
+          car_stop_all();
+          gimbal_test_sweep_safe();
+        } else if(mode==7 && set==0) {
+          car_stop_all();
+          gimbal_center();
         }
 
         /* 其他 mode 且 set=0 时，由各自的 trackN() 函数内部判断，或在 main 循环里已经 car_stop_all() */

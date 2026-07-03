@@ -602,6 +602,12 @@ static void task1_run_once(void)
     }
 }
 
+static void mode3_aim_run(void)
+{
+    motor_output_both(0, 0);
+    gimbal_aim_B();
+}
+
 /* ============================================================================
  *  main() 和 TIMG8 ISR
  * ========================================================================== */
@@ -661,6 +667,10 @@ int main(void)
 			     /* 当前停止 -> 启动 */
 			     set = 1;
 			     if (mode==2) task1_reset();     /* mode2: 校赛任务一，一圈后自动停车 */
+			     if (mode==3) {
+			         car_stop_all();   /* mode3: 定点瞄准，车必须静止 */
+			         gimbal_aim_B();
+			     }
 			     if (mode==5) mission_reset();   /* mode5: 复位任务状态机 */
 			     if (mode==6) motor_test_reset(); /* mode6: 复位电机测试计数器 */
 			     if (mode==7) {
@@ -672,6 +682,9 @@ int main(void)
 			     /* 当前运行 -> 停止 */
 			     set = 0;
 			     car_stop_all();  /* 立即停止电机，清空状态 */
+			     if (mode==3) {
+			         gimbal_center();  /* mode3: 停止时回安全中位 */
+			     }
 			     if (mode==7) {
 			         mode7_diag_reset();
 			         gimbal_center();  /* mode7: 停止时云台回安全中位 */
@@ -681,9 +694,11 @@ int main(void)
 
           /*
            * PA16 pitch uses software PWM. Run one 20ms frame only while the car
-           * is stopped in mode7 gimbal test; never block inside TIMG8 ISR.
+           * is stopped for aiming/test phases; never block inside TIMG8 ISR.
            */
-          if (mode==7 && set==1) {
+          if ((mode==3) ||
+              (mode==7 && set==1) ||
+              (mode==5 && set==1 && mission_state==TASK_GIMBAL_AIM)) {
               gimbal_pitch_soft_pwm_service();
           }
 
@@ -709,7 +724,7 @@ void TIMG8_IRQHandler()
 		   }
 			 	if(mode==3&&set==1)
 		   {
-          track3();
+          mode3_aim_run();
 		   }
 			 	if(mode==4&&set==1)
 		   {

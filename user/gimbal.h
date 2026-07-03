@@ -51,7 +51,7 @@
 
 #define GIMBAL_PITCH_CENTER_US     1500
 #define GIMBAL_PITCH_MIN_SAFE_US   1300
-#define GIMBAL_PITCH_MAX_SAFE_US   1700
+#define GIMBAL_PITCH_MAX_SAFE_US   2100
 
 #define GIMBAL_STEP_US             10
 #define GIMBAL_SWEEP_INTERVAL_MS   20
@@ -60,8 +60,8 @@
 #define GIMBAL_USE_SAFE_LIMIT 1
 
 /* ---- 瞄准 B 点的预置脉宽（必须在真实硬件上标定！下面是占位初值） ---- */
-#define GIMBAL_AIM_B_YAW_US   1500
-#define GIMBAL_AIM_B_PITCH_US 1500
+#define GIMBAL_AIM_B_YAW_US   1700
+#define GIMBAL_AIM_B_PITCH_US 1800
 #define GIMBAL_CENTER_YAW_US   1500
 #define GIMBAL_CENTER_PITCH_US 1500
 

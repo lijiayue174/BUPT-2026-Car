@@ -120,6 +120,11 @@ static int line_lost_count = 0;           /* continuous all-white sample count *
 static int line_last_black_cnt = 0;       /* last sample black sensor count, for mode2 task1 only */
 static int mode7_diag_tick = 0;           /* mode7 hardware diag tick, 10ms per tick */
 static uint8_t mode7_led_state = 0;
+static uint8_t mode3_aim_started = 0;
+static int mode3_current_yaw_us = GIMBAL_CENTER_YAW_US;
+static int mode3_current_pitch_us = GIMBAL_CENTER_PITCH_US;
+
+#define MODE3_AIM_STEP_US        10       /* smooth 10us per 10ms tick, avoids startup kick */
 
 /* ==================== mode2: 校赛任务一，顺时针 A-B-C-D-A ==================== */
 #define TASK1_COUNT_TO_DIST       0.20f   /* same odom scale as mission.c, tune on site if distance is off */
@@ -602,10 +607,51 @@ static void task1_run_once(void)
     }
 }
 
+static int mode3_step_to_target(int current, int target)
+{
+    if (current < target) {
+        current += MODE3_AIM_STEP_US;
+        if (current > target) current = target;
+    } else if (current > target) {
+        current -= MODE3_AIM_STEP_US;
+        if (current < target) current = target;
+    }
+    return current;
+}
+
+static void mode3_aim_prepare(void)
+{
+    mode3_aim_started = 1;
+    mode3_current_yaw_us = gimbal_yaw_us_now;
+    mode3_current_pitch_us = gimbal_pitch_us_now;
+    gimbal_set_pulse_us((uint16_t)mode3_current_yaw_us,
+        (uint16_t)mode3_current_pitch_us);
+}
+
+static void mode3_aim_reset(void)
+{
+    mode3_aim_started = 0;
+    mode3_current_yaw_us = GIMBAL_CENTER_YAW_US;
+    mode3_current_pitch_us = GIMBAL_CENTER_PITCH_US;
+    gpio_set(GPIOB, DL_GPIO_PIN_26, 0);
+    gimbal_center();
+}
+
 static void mode3_aim_run(void)
 {
     motor_output_both(0, 0);
-    gimbal_aim_B();
+
+    if (!mode3_aim_started) {
+        mode3_aim_prepare();
+    }
+
+    mode3_current_yaw_us = mode3_step_to_target(mode3_current_yaw_us,
+        GIMBAL_AIM_B_YAW_US);
+    mode3_current_pitch_us = mode3_step_to_target(mode3_current_pitch_us,
+        GIMBAL_AIM_B_PITCH_US);
+
+    gimbal_set_pulse_us((uint16_t)mode3_current_yaw_us,
+        (uint16_t)mode3_current_pitch_us);
 }
 
 /* ============================================================================
@@ -654,6 +700,9 @@ int main(void)
        /* mode 切换时强制停止 */
        set=0;
        car_stop_all();  /* 立即停止电机，清空状态 */
+       if (mode==3) {
+           mode3_aim_reset();
+       }
        if (mode==7) {
            mode7_diag_reset();
            gimbal_center();  /* mode7: 云台独立测试，切入时先回安全中位 */
@@ -669,7 +718,7 @@ int main(void)
 			     if (mode==2) task1_reset();     /* mode2: 校赛任务一，一圈后自动停车 */
 			     if (mode==3) {
 			         car_stop_all();   /* mode3: 定点瞄准，车必须静止 */
-			         gimbal_aim_B();
+			         mode3_aim_prepare();
 			     }
 			     if (mode==5) mission_reset();   /* mode5: 复位任务状态机 */
 			     if (mode==6) motor_test_reset(); /* mode6: 复位电机测试计数器 */
@@ -683,7 +732,7 @@ int main(void)
 			     set = 0;
 			     car_stop_all();  /* 立即停止电机，清空状态 */
 			     if (mode==3) {
-			         gimbal_center();  /* mode3: 停止时回安全中位 */
+			         mode3_aim_reset();  /* mode3: 停止时回安全中位 */
 			     }
 			     if (mode==7) {
 			         mode7_diag_reset();

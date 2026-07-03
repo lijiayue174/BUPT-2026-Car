@@ -97,21 +97,25 @@ static void oled_debug_update(void)
 #define MOTOR_TEST_RIGHT_DIR       1      /* 右轮方向，反了改成 -1 */
 
 /* ==================== 低速循迹测试参数（阶段4专用） ==================== */
-#define LINE_TEST_PWM_BASE          2200   /* low-speed line base PWM; if motor stalls, try 2300/2400 on site */
+#define LINE_TEST_PWM_BASE          1800   /* slower curve tracing gives the car time to rotate */
 #define LINE_TEST_PWM_MIN           0
 #define LINE_TEST_PWM_MAX           3600
-#define LINE_TEST_TURN_GAIN         160    /* bias -> differential PWM gain */
-#define LINE_TEST_RIGHT_TURN_GAIN   420    /* stronger gain when bias < 0, for clockwise/right curves */
-#define LINE_TEST_RIGHT_TURN_OFFSET 500    /* right-turn preload once line moves to the right side */
-#define LINE_TEST_RIGHT_TURN_EXTRA  300    /* extra right turn when abs(bias) >= 0.5 */
-#define LINE_TEST_TURN_MAX          1800   /* max differential PWM */
-#define LINE_TEST_CURVE_SLOW_GAIN   80     /* larger bias -> lower dynamic base */
-#define LINE_TEST_RIGHT_SLOW_GAIN   140    /* stronger slowing when bias < 0 */
-#define LINE_TEST_PWM_BASE_MIN      1600   /* minimum moving base while line is visible */
-#define LINE_TEST_RIGHT_BASE_MIN    1200   /* allow lower base in 40cm clockwise/right curves */
+#define LINE_TEST_TURN_GAIN         430    /* keep enough angular speed through the arc */
+#define LINE_TEST_LEFT_TURN_OFFSET  350    /* preload after the line leaves center sensors */
+#define LINE_TEST_LEFT_TURN_EXTRA   300    /* extra left turn when abs(bias) >= 1.0 */
+#define LINE_TEST_RIGHT_TURN_GAIN   430    /* symmetric right-turn gain */
+#define LINE_TEST_RIGHT_TURN_OFFSET 350    /* preload after the line leaves center sensors */
+#define LINE_TEST_RIGHT_TURN_EXTRA  300    /* extra right turn when abs(bias) >= 1.0 */
+#define LINE_TEST_TURN_MAX          2100   /* allow enough turn before arc exit */
+#define LINE_TEST_EDGE_TURN         2000   /* D1/D2 or D7/D8 on line: force hard recovery */
+#define LINE_TEST_EDGE_PWM_BASE     1100   /* slow down while recovering from edge sensors */
+#define LINE_TEST_CURVE_SLOW_GAIN   180    /* larger bias -> lower dynamic base */
+#define LINE_TEST_RIGHT_SLOW_GAIN   180
+#define LINE_TEST_PWM_BASE_MIN      950    /* slow down sharply when line is far from D4/D5 */
+#define LINE_TEST_RIGHT_BASE_MIN    950
 #define LINE_TEST_BIAS_SIGN         1      /* reverse to -1 if steering direction is wrong */
-#define LINE_TEST_LOST_SHORT_COUNT  20     /* 20 * 10ms: keep searching shortly after line loss */
-#define LINE_TEST_LOST_PWM_BASE     1600   /* slow search base after short line loss */
+#define LINE_TEST_LOST_SHORT_COUNT  60     /* keep last turn for 0.6s after arc line loss */
+#define LINE_TEST_LOST_PWM_BASE     1300   /* slow search base after short line loss */
 
 /* ==================== 测试状态变量（需在函数前声明） ==================== */
 static int motor_test_tick = 0;           /* 电机测试计数器 */
@@ -129,13 +133,19 @@ static int mode3_current_pitch_us = GIMBAL_CENTER_PITCH_US;
 /* ==================== mode2: 校赛任务一，顺时针 A-B-C-D-A ==================== */
 #define TASK1_COUNT_TO_DIST       0.20f   /* same odom scale as mission.c, tune on site if distance is off */
 #define TASK1_STRAIGHT_DIST_MM    1000.0f /* A-B and C-D straight section, 100cm */
-#define TASK1_STRAIGHT_LEFT_PWM   1100    /* straight-only trim: lower left to reduce right drift */
+#define TASK1_STRAIGHT_LEFT_PWM   850     /* straight-only trim: lower left to reduce right drift */
 #define TASK1_STRAIGHT_RIGHT_PWM  1850
 #define TASK1_STRAIGHT_BALANCE_GAIN 0.0f  /* 0 disables encoder balance while tuning straight PWM */
 #define TASK1_STRAIGHT_BALANCE_MAX  900
 #define TASK1_STRAIGHT_BLACK_MIN_TICKS 30 /* allow black-line handoff after 0.3s straight */
 #define TASK1_ARC_MIN_TICKS       80      /* ignore line loss at arc entry for 0.8s */
 #define TASK1_ARC_LOST_TICKS      25      /* 0.25s all-white after arc means arc finished */
+#define TASK3_ARC_MIN_TICKS       140     /* mode5: ignore short all-white gaps inside the first curve */
+#define TASK3_ARC_LOST_TICKS      50      /* mode5: require 0.5s all-white before ending an arc */
+#define YAW_STRAIGHT_GAIN         32      /* PWM correction per yaw degree */
+#define YAW_STRAIGHT_MAX          1100    /* max left/right PWM correction */
+#define YAW_STRAIGHT_DEADBAND     1       /* ignore tiny yaw jitter within +/-1 degree */
+#define YAW_STRAIGHT_SIGN         -1       /* if straight correction gets worse, change to -1 */
 
 typedef enum {
     TASK1_AB_STRAIGHT = 0,
@@ -144,6 +154,15 @@ typedef enum {
     TASK1_DA_ARC,
     TASK1_DONE
 } task1_phase_t;
+
+typedef enum {
+    TASK3_AB_STRAIGHT = 0,
+    TASK3_B_AIM,
+    TASK3_BC_ARC,
+    TASK3_CD_STRAIGHT,
+    TASK3_DA_ARC,
+    TASK3_DONE
+} task3_phase_t;
 
 static task1_phase_t task1_phase = TASK1_AB_STRAIGHT;
 static float task1_dist = 0.0f;
@@ -154,6 +173,18 @@ static int task1_arc_lost_ticks = 0;
 static int task1_arc_done_count = 0;
 static uint8_t task1_arc_seen_line = 0;
 static uint8_t task1_finished = 0;
+static int task1_straight_yaw_target = 0;
+
+static task3_phase_t task3_phase = TASK3_AB_STRAIGHT;
+static float task3_dist = 0.0f;
+static float task3_left_dist = 0.0f;
+static float task3_right_dist = 0.0f;
+static int task3_phase_ticks = 0;
+static int task3_arc_lost_ticks = 0;
+static int task3_aim_ticks = 0;
+static uint8_t task3_arc_seen_line = 0;
+static uint8_t task3_finished = 0;
+static int task3_straight_yaw_target = 0;
 
 static void task1_clear_state(void)
 {
@@ -166,6 +197,21 @@ static void task1_clear_state(void)
     task1_arc_done_count = 0;
     task1_arc_seen_line = 0;
     task1_finished = 0;
+    task1_straight_yaw_target = yaw_angle_int;
+}
+
+static void task3_clear_state(void)
+{
+    task3_phase = TASK3_AB_STRAIGHT;
+    task3_dist = 0.0f;
+    task3_left_dist = 0.0f;
+    task3_right_dist = 0.0f;
+    task3_phase_ticks = 0;
+    task3_arc_lost_ticks = 0;
+    task3_aim_ticks = 0;
+    task3_arc_seen_line = 0;
+    task3_finished = 0;
+    task3_straight_yaw_target = yaw_angle_int;
 }
 
 static void mode7_diag_reset(void)
@@ -232,6 +278,11 @@ static void motor_output_right(int pwm)
 /* 同时设置左右轮（方便统一调用） */
 static void motor_output_both(int left_pwm, int right_pwm)
 {
+    if (mode==5 && set==1 && (left_pwm != 0 || right_pwm != 0)) {
+        left_pwm = left_pwm * 7 / 10;
+        right_pwm = right_pwm * 7 / 10;
+    }
+
     motor_output_left(left_pwm);
     motor_output_right(right_pwm);
 }
@@ -258,6 +309,7 @@ static void car_stop_all(void)
     line_lost_count = 0;
     line_last_black_cnt = 0;
     task1_clear_state();
+    task3_clear_state();
 
     /* mission 状态解除（mode5 专用，其他 mode 调用无害） */
     mission_disarm();
@@ -339,6 +391,12 @@ static void task1_reset(void)
     task1_clear_state();
 }
 
+static void task3_reset(void)
+{
+    motor_test_reset();
+    task3_clear_state();
+}
+
 static int line_test_limit_pwm(int pwm)
 {
     if (pwm > LINE_TEST_PWM_MAX) return LINE_TEST_PWM_MAX;
@@ -368,6 +426,7 @@ static void line_follow_test_run(void)
 {
     uint8_t gray[8];
     int i, black_cnt, turn, abs_bias_x10, dynamic_base, base_min, left_pwm, right_pwm;
+    int center_on_line, left_edge_on_line, right_edge_on_line;
     int turn_gain, slow_gain;
     float sum, bias, abs_bias;
 
@@ -379,6 +438,9 @@ static void line_follow_test_run(void)
     for (i = 0; i < 8; i++) {
         gray[i] = gray_mapped(i + 1);  /* gray_mapped(1~8) */
     }
+    center_on_line = (gray[3] == 0 || gray[4] == 0);
+    left_edge_on_line = (gray[0] == 0 || gray[1] == 0);
+    right_edge_on_line = (gray[6] == 0 || gray[7] == 0);
 
     /* 2. 计算加权偏差（只对压线的传感器 gray[i]==0 求权重平均） */
     for (i = 0; i < 8; i++) {
@@ -425,9 +487,9 @@ static void line_follow_test_run(void)
      * also lowers dynamic_base, so sharp curves slow down and the inner wheel
      * may fall to 0 instead of being lifted to a start threshold.
      *
-     * On this car, clockwise/right curves are weaker. The 40cm contest arc
-     * needs earlier correction, so bias < 0 uses a preload offset instead of
-     * waiting for D7/D8 to create a large averaged bias.
+     * D4/D5 are the center sensors. When either one still sees the line, avoid
+     * preload, but keep the normal proportional turn so the car keeps rotating
+     * through the arc instead of leaving on an early tangent.
      */
     if (bias < 0.0f) {
         turn_gain = LINE_TEST_RIGHT_TURN_GAIN;
@@ -440,12 +502,24 @@ static void line_follow_test_run(void)
     }
 
     turn = (int)(bias * turn_gain);
-    if (bias < 0.0f) {
+    if (!center_on_line && bias > 0.0f) {
+        turn += LINE_TEST_LEFT_TURN_OFFSET;
+        if (abs_bias_x10 >= 10) {
+            turn += LINE_TEST_LEFT_TURN_EXTRA;
+        }
+    } else if (!center_on_line && bias < 0.0f) {
         turn -= LINE_TEST_RIGHT_TURN_OFFSET;
-        if (abs_bias_x10 >= 5) {
+        if (abs_bias_x10 >= 10) {
             turn -= LINE_TEST_RIGHT_TURN_EXTRA;
         }
     }
+
+    if (!center_on_line && left_edge_on_line && turn < LINE_TEST_EDGE_TURN) {
+        turn = LINE_TEST_EDGE_TURN;
+    } else if (!center_on_line && right_edge_on_line && turn > -LINE_TEST_EDGE_TURN) {
+        turn = -LINE_TEST_EDGE_TURN;
+    }
+
     if (turn > LINE_TEST_TURN_MAX)  turn = LINE_TEST_TURN_MAX;
     if (turn < -LINE_TEST_TURN_MAX) turn = -LINE_TEST_TURN_MAX;
     line_last_turn = turn;
@@ -453,6 +527,9 @@ static void line_follow_test_run(void)
     dynamic_base = LINE_TEST_PWM_BASE - abs_bias_x10 * slow_gain / 10;
     if (dynamic_base < base_min) {
         dynamic_base = base_min;
+    }
+    if (!center_on_line && (left_edge_on_line || right_edge_on_line)) {
+        dynamic_base = LINE_TEST_EDGE_PWM_BASE;
     }
 
     /* 5. 计算左右轮 PWM（dynamic_base - turn, dynamic_base + turn） */
@@ -498,6 +575,35 @@ static void task1_odom_update(void)
     }
 }
 
+static int yaw_normalize_error(int error)
+{
+    while (error > 180) error -= 360;
+    while (error < -180) error += 360;
+    return error;
+}
+
+static int yaw_limit_correction(int correction)
+{
+    if (correction > YAW_STRAIGHT_MAX) return YAW_STRAIGHT_MAX;
+    if (correction < -YAW_STRAIGHT_MAX) return -YAW_STRAIGHT_MAX;
+    return correction;
+}
+
+static void yaw_drive_straight(int yaw_target)
+{
+    int error, correction;
+
+    error = yaw_normalize_error(yaw_angle_int - yaw_target);
+    if (error <= YAW_STRAIGHT_DEADBAND && error >= -YAW_STRAIGHT_DEADBAND) {
+        correction = 0;
+    } else {
+        correction = yaw_limit_correction(error * YAW_STRAIGHT_GAIN * YAW_STRAIGHT_SIGN);
+    }
+
+    motor_output_both(TASK1_STRAIGHT_LEFT_PWM + correction,
+                      TASK1_STRAIGHT_RIGHT_PWM - correction);
+}
+
 static void task1_next_phase(task1_phase_t next_phase)
 {
     task1_phase = next_phase;
@@ -508,6 +614,9 @@ static void task1_next_phase(task1_phase_t next_phase)
     task1_arc_lost_ticks = 0;
     task1_arc_seen_line = 0;
     line_lost_count = 0;
+    if (next_phase == TASK1_AB_STRAIGHT || next_phase == TASK1_CD_STRAIGHT) {
+        task1_straight_yaw_target = yaw_angle_int;
+    }
 }
 
 static void task1_finish(void)
@@ -521,18 +630,7 @@ static void task1_finish(void)
 
 static void task1_drive_straight(void)
 {
-    int balance;
-
-    balance = (int)((task1_left_dist - task1_right_dist) * TASK1_STRAIGHT_BALANCE_GAIN);
-    if (balance > TASK1_STRAIGHT_BALANCE_MAX) {
-        balance = TASK1_STRAIGHT_BALANCE_MAX;
-    }
-    if (balance < -TASK1_STRAIGHT_BALANCE_MAX) {
-        balance = -TASK1_STRAIGHT_BALANCE_MAX;
-    }
-
-    motor_output_both(TASK1_STRAIGHT_LEFT_PWM - balance,
-                      TASK1_STRAIGHT_RIGHT_PWM + balance);
+    yaw_drive_straight(task1_straight_yaw_target);
 }
 
 static void task1_run_arc(task1_phase_t next_phase)
@@ -654,6 +752,142 @@ static void mode3_aim_run(void)
         (uint16_t)mode3_current_pitch_us);
 }
 
+static void task3_odom_update(void)
+{
+    float left_d, right_d, d;
+
+    left_d = (float)left_encoder * TASK1_COUNT_TO_DIST;
+    right_d = (float)right_encoder * TASK1_COUNT_TO_DIST;
+    if (left_d > 0.0f) {
+        task3_left_dist += left_d;
+    }
+    if (right_d > 0.0f) {
+        task3_right_dist += right_d;
+    }
+
+    d = (left_d + right_d) * 0.5f;
+    if (d > 0.0f) {
+        task3_dist += d;
+    }
+}
+
+static void task3_next_phase(task3_phase_t next_phase)
+{
+    task3_phase = next_phase;
+    task3_dist = 0.0f;
+    task3_left_dist = 0.0f;
+    task3_right_dist = 0.0f;
+    task3_phase_ticks = 0;
+    task3_arc_lost_ticks = 0;
+    task3_arc_seen_line = 0;
+    line_lost_count = 0;
+    if (next_phase == TASK3_AB_STRAIGHT || next_phase == TASK3_CD_STRAIGHT) {
+        task3_straight_yaw_target = yaw_angle_int;
+    }
+}
+
+static void task3_finish(void)
+{
+    task3_finished = 1;
+    task3_phase = TASK3_DONE;
+    set = 0;
+    motor_output_both(0, 0);
+    DL_GPIO_clearPins(GPIOA, DL_GPIO_PIN_16);
+    beep();
+}
+
+static void task3_drive_straight(void)
+{
+    yaw_drive_straight(task3_straight_yaw_target);
+}
+
+static void task3_run_arc(task3_phase_t next_phase)
+{
+    if (!task3_arc_seen_line) {
+        if (task1_sample_black_count() == 0) {
+            task3_drive_straight();
+            return;
+        }
+        task3_arc_seen_line = 1;
+        line_lost_count = 0;
+    }
+
+    line_follow_test_run();
+    task3_phase_ticks++;
+
+    if (task3_arc_seen_line && line_last_black_cnt == 0 && task3_phase_ticks > TASK3_ARC_MIN_TICKS) {
+        task3_arc_lost_ticks++;
+    } else {
+        task3_arc_lost_ticks = 0;
+    }
+
+    if (task3_arc_lost_ticks >= TASK3_ARC_LOST_TICKS) {
+        if (next_phase == TASK3_DONE) {
+            task3_finish();
+        } else {
+            beep();
+            task3_next_phase(next_phase);
+        }
+    }
+}
+
+static void task3_run_once(void)
+{
+    if (task3_finished) {
+        motor_output_both(0, 0);
+        return;
+    }
+
+    task3_odom_update();
+
+    switch (task3_phase) {
+    case TASK3_AB_STRAIGHT:
+        task3_phase_ticks++;
+        task3_drive_straight();
+        if ((task1_sample_black_count() > 0 && task3_phase_ticks >= TASK1_STRAIGHT_BLACK_MIN_TICKS) ||
+            task3_dist >= TASK1_STRAIGHT_DIST_MM) {
+            motor_output_both(0, 0);
+            beep();
+            gimbal_center();
+            task3_next_phase(TASK3_B_AIM);
+            task3_aim_ticks = 300;
+        }
+        break;
+
+    case TASK3_B_AIM:
+        motor_output_both(0, 0);
+        gimbal_center();
+        if (--task3_aim_ticks <= 0) {
+            gimbal_center();
+            DL_GPIO_clearPins(GPIOA, DL_GPIO_PIN_16);
+            task3_next_phase(TASK3_BC_ARC);
+        }
+        break;
+
+    case TASK3_BC_ARC:
+        task3_run_arc(TASK3_CD_STRAIGHT);
+        break;
+
+    case TASK3_CD_STRAIGHT:
+        task3_phase_ticks++;
+        task3_drive_straight();
+        if ((task1_sample_black_count() > 0 && task3_phase_ticks >= TASK1_STRAIGHT_BLACK_MIN_TICKS) ||
+            task3_dist >= TASK1_STRAIGHT_DIST_MM) {
+            beep();
+            task3_next_phase(TASK3_DA_ARC);
+        }
+        break;
+
+    case TASK3_DA_ARC:
+        task3_run_arc(TASK3_DONE);
+        break;
+
+    default:
+        task3_finish();
+        break;
+    }
+}
+
 /* ============================================================================
  *  main() 和 TIMG8 ISR
  * ========================================================================== */
@@ -715,12 +949,13 @@ int main(void)
 			 if (set == 0) {
 			     /* 当前停止 -> 启动 */
 			     set = 1;
+			     if (mode==1) beep();            /* mode1: 声光自检 */
 			     if (mode==2) task1_reset();     /* mode2: 校赛任务一，一圈后自动停车 */
 			     if (mode==3) {
 			         car_stop_all();   /* mode3: 定点瞄准，车必须静止 */
 			         mode3_aim_prepare();
 			     }
-			     if (mode==5) mission_reset();   /* mode5: 复位任务状态机 */
+			     if (mode==5) task3_reset();     /* mode5: 任务三，复用mode2路线+B点打靶 */
 			     if (mode==6) motor_test_reset(); /* mode6: 复位电机测试计数器 */
 			     if (mode==7) {
 			         car_stop_all();   /* mode7: 启动云台测试前确保电机无残留 PWM */
@@ -747,7 +982,7 @@ int main(void)
            */
           if ((mode==3) ||
               (mode==7 && set==1) ||
-              (mode==5 && set==1 && mission_state==TASK_GIMBAL_AIM)) {
+              (mode==5 && set==1 && task3_phase==TASK3_B_AIM)) {
               gimbal_pitch_soft_pwm_service();
           }
 
@@ -781,7 +1016,7 @@ void TIMG8_IRQHandler()
 		   }
 			  if(mode==5&&set==1)          /* ??:????????? */
        {
-          mission_run();
+          task3_run_once();
        }
 
         /* mode 6 临时测试：阶段3电机测试 / 阶段4低速循迹测试 */

@@ -168,6 +168,10 @@ static int mode3_current_pitch_us = GIMBAL_CENTER_PITCH_US;
 #define TASK1_ARC_LOST_TICKS      25      /* 0.25s all-white after arc means arc finished */
 #define TASK3_ARC_MIN_TICKS       140     /* mode5: ignore short all-white gaps inside the first curve */
 #define TASK3_ARC_LOST_TICKS      50      /* mode5: require 0.5s all-white before ending an arc */
+#define TASK3_AB_STRAIGHT_YAW_TARGET 0
+#define TASK3_CD_STRAIGHT_LEFT_PWM 2550   /* slightly slower than AB, still above the 2500 start floor */
+#define TASK3_CD_STRAIGHT_RIGHT_PWM 2550
+#define TASK3_CD_STRAIGHT_YAW_ABS_TARGET 180
 #define YAW_STRAIGHT_GAIN         180     /* PWM correction per yaw degree */
 #define YAW_STRAIGHT_MAX          2400    /* max left/right PWM correction */
 #define YAW_STRAIGHT_DEADBAND     3       /* allow -3..+3 deg on straight without twitching */
@@ -710,6 +714,24 @@ static int yaw_limit_correction(int correction)
     return correction;
 }
 
+static int yaw_abs_int(int angle)
+{
+    return (angle < 0) ? -angle : angle;
+}
+
+static int task3_cd_straight_yaw_error(void)
+{
+    int yaw;
+    int error;
+
+    yaw = yaw_relative_int();
+    error = TASK3_CD_STRAIGHT_YAW_ABS_TARGET - yaw_abs_int(yaw);
+    if (yaw < 0) {
+        error = -error;
+    }
+    return error;
+}
+
 static int yaw_adaptive_straight_correction(int error)
 {
     int error_sign, correction, boost_pct;
@@ -764,19 +786,28 @@ static void yaw_drive_straight(int yaw_target)
                       TASK1_STRAIGHT_RIGHT_PWM - correction);
 }
 
-static int yaw_arc_exit_is_aligned(void)
+static void task3_drive_cd_straight(void)
+{
+    int correction;
+
+    correction = yaw_adaptive_straight_correction(task3_cd_straight_yaw_error());
+    motor_output_both(TASK3_CD_STRAIGHT_LEFT_PWM - correction,
+                      TASK3_CD_STRAIGHT_RIGHT_PWM + correction);
+}
+
+static int yaw_arc_exit_is_aligned(int yaw_target)
 {
     int error;
 
-    error = yaw_normalize_error(yaw_relative_int());
+    error = yaw_normalize_error(yaw_relative_int() - yaw_target);
     return (error <= YAW_ARC_EXIT_DEADBAND && error >= -YAW_ARC_EXIT_DEADBAND);
 }
 
-static void yaw_arc_exit_align_turn(void)
+static void yaw_arc_exit_align_turn(int yaw_target)
 {
     int error, correction;
 
-    error = yaw_normalize_error(yaw_relative_int());
+    error = yaw_normalize_error(yaw_relative_int() - yaw_target);
     correction = yaw_limit_correction(error * YAW_STRAIGHT_GAIN * YAW_STRAIGHT_SIGN);
     if (correction > 0 && correction < YAW_ARC_ALIGN_TURN) {
         correction = YAW_ARC_ALIGN_TURN;
@@ -824,7 +855,7 @@ static void task1_run_arc(task1_phase_t next_phase)
 {
     if (task1_arc_aligning) {
         task1_arc_align_ticks++;
-        if (yaw_arc_exit_is_aligned() ||
+        if (yaw_arc_exit_is_aligned(0) ||
             task1_arc_align_ticks >= YAW_ARC_ALIGN_MAX_TICKS) {
             task1_arc_aligning = 0;
             task1_arc_done_count++;
@@ -834,7 +865,7 @@ static void task1_run_arc(task1_phase_t next_phase)
                 task1_next_phase(next_phase);
             }
         } else {
-            yaw_arc_exit_align_turn();
+            yaw_arc_exit_align_turn(0);
         }
         return;
     }
@@ -985,7 +1016,11 @@ static void task3_next_phase(task3_phase_t next_phase)
     task3_arc_aligning = 0;
     line_lost_count = 0;
     if (next_phase == TASK3_AB_STRAIGHT || next_phase == TASK3_CD_STRAIGHT) {
-        task3_straight_yaw_target = 0;
+        if (next_phase == TASK3_CD_STRAIGHT) {
+            task3_straight_yaw_target = TASK3_CD_STRAIGHT_YAW_ABS_TARGET;
+        } else {
+            task3_straight_yaw_target = TASK3_AB_STRAIGHT_YAW_TARGET;
+        }
         yaw_straight_adapt_reset();
     }
 }
@@ -1002,6 +1037,11 @@ static void task3_finish(void)
 
 static void task3_drive_straight(void)
 {
+    if (task3_phase == TASK3_CD_STRAIGHT) {
+        task3_drive_cd_straight();
+        return;
+    }
+
     yaw_drive_straight(task3_straight_yaw_target);
 }
 
@@ -1024,9 +1064,12 @@ static uint8_t task3_run_straight_until_black(void)
 
 static void task3_run_arc(task3_phase_t next_phase)
 {
+    int arc_exit_yaw_target;
+
+    arc_exit_yaw_target = TASK3_AB_STRAIGHT_YAW_TARGET;
     if (task3_arc_aligning) {
         task3_arc_align_ticks++;
-        if (yaw_arc_exit_is_aligned() ||
+        if (yaw_arc_exit_is_aligned(arc_exit_yaw_target) ||
             task3_arc_align_ticks >= YAW_ARC_ALIGN_MAX_TICKS) {
             task3_arc_aligning = 0;
             if (next_phase == TASK3_DONE) {
@@ -1036,7 +1079,7 @@ static void task3_run_arc(task3_phase_t next_phase)
                 task3_next_phase(next_phase);
             }
         } else {
-            yaw_arc_exit_align_turn();
+            yaw_arc_exit_align_turn(arc_exit_yaw_target);
         }
         return;
     }
@@ -1060,9 +1103,16 @@ static void task3_run_arc(task3_phase_t next_phase)
     }
 
     if (task3_arc_lost_ticks >= TASK3_ARC_LOST_TICKS) {
-        beep();
-        task3_arc_aligning = 1;
-        task3_arc_align_ticks = 0;
+        if (next_phase == TASK3_CD_STRAIGHT) {
+            beep();
+            task3_next_phase(next_phase);
+        } else if (next_phase == TASK3_DONE) {
+            task3_finish();
+        } else {
+            beep();
+            task3_arc_aligning = 1;
+            task3_arc_align_ticks = 0;
+        }
     }
 }
 
@@ -1102,11 +1152,8 @@ static void task3_run_once(void)
 
     case TASK3_CD_STRAIGHT:
         if (task3_run_straight_until_black()) {
-            motor_output_both(0, 0);
             beep();
-            gimbal_center();
-            task3_next_phase(TASK3_C_AIM);
-            task3_aim_ticks = 300;
+            task3_next_phase(TASK3_DA_ARC);
         }
         break;
 

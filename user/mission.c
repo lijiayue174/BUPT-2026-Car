@@ -18,6 +18,9 @@
  * 如需恢复正装：改为 {1,2,3,4,5,6,7,8} */
 static const uint8_t mission_gray_map[8] = {8, 7, 6, 5, 4, 3, 2, 1};
 
+/* ===================== 函数前向声明 ===================== */
+static void mission_stop(void);  /* 停车函数前向声明 */
+
 int mission_gray_mapped(int logic_idx)
 {
     /* logic_idx: 1~8（逻辑通道，从左到右）
@@ -44,6 +47,23 @@ static int   aim_timer = 0;            /* 云台瞄准停留倒计时 */
 static int   mission_armed = 0;        /* 进入 mode5 自复位一次 */
 
 static float last_marker_dist = -1e9f; /* 上一次关键点的里程（防抖间隔用） */
+static float trace_state_entry_dist = 0.0f;
+
+/* ===================== TASK_TRACE_TO_C white corridor guard ===================== */
+static uint8_t trace_c_white_guard_active = 0;  /* 全白路段保护是否激活 */
+static uint8_t trace_c_black_count = 0;         /* 连续检测到黑线的次数 */
+static int     trace_c_yaw_ref = 0;             /* 进入 TRACE_TO_C 时的 yaw 参考 */
+
+/* ===================== 蜂鸣器触发原因诊断 ===================== */
+static volatile int mission_last_beep_reason = 0;
+static volatile int mission_last_beep_state = 0;
+static volatile uint8_t mission_last_beep_bd = 0xFF;
+static volatile uint8_t mission_last_beep_nodata = 0xFF;
+static volatile float mission_last_beep_dist = 0.0f;
+
+static uint8_t mission_debug_start_marker_done = 0;
+static int mission_debug_start_timer = 0;
+static int mission_debug_start_phase = 0;
 
 /* 8 路权重表 */
 static const float kW[8] = {
@@ -85,6 +105,164 @@ static void mission_gray_update(void)
 
 float mission_get_bias(void) { return mission_bias; }
 
+/* ===================== 蜂鸣器触发原因诊断与保护 ===================== */
+/* 判断是否应该阻止 beep（TRACE_TO_C white guard 期间） */
+static int mission_beep_blocked_in_trace_c(void)
+{
+    if (mission_state == TASK_TRACE_TO_C && trace_c_white_guard_active) {
+        return 1;  /* 阻止 beep */
+    }
+    return 0;
+}
+
+/* 包装 beep() 调用，记录触发原因和上下文 */
+static void mission_beep_reason(int reason)
+{
+    /* 记录触发上下文 */
+    mission_last_beep_reason = reason;
+    mission_last_beep_state = mission_state;
+    mission_last_beep_bd = mission_gray_bd;
+    mission_last_beep_nodata = mission_nodata;
+    mission_last_beep_dist = mission_dist;
+
+    /* 如果在 TRACE_TO_C white guard 期间，阻止 beep */
+    if (mission_beep_blocked_in_trace_c()) {
+#if MISSION_DEBUG_STOP_ON_BEEP_IN_TRACE_C
+        /* 调试模式：立即停车，不继续右拐 */
+        mission_stop();
+#endif
+        return;  /* 不真正调用 beep() */
+    }
+
+    /* 正常调用 beep */
+    beep();
+
+#if MISSION_DEBUG_STOP_ON_BEEP_IN_TRACE_C
+    /* 调试模式：TRACE_TO_C 中如果真的触发了 beep，立即停车 */
+    if (mission_state == TASK_TRACE_TO_C) {
+        mission_stop();
+    }
+#endif
+}
+
+static int mission_debug_start_marker_service(void)
+{
+#if MISSION_DEBUG_START_MARKER_ENABLE
+    if (mission_debug_start_marker_done) {
+        return 0;
+    }
+
+    mission_stop();
+
+    if (mission_debug_start_timer == 20 && mission_debug_start_phase == 0) {
+        beep();
+        mission_debug_start_phase = 1;
+    } else if (mission_debug_start_timer == 100 && mission_debug_start_phase == 1) {
+        beep();
+        mission_debug_start_phase = 2;
+    }
+
+    mission_debug_start_timer++;
+    if (mission_debug_start_timer >= MISSION_DEBUG_START_MARKER_TICKS) {
+        mission_debug_start_marker_done = 1;
+        return 1;
+    }
+
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+/* ===================== TASK_TRACE_TO_C white corridor guard 辅助函数 ===================== */
+/* 统计 bd 中黑色通道数量（bit=0 表示黑线） */
+static int mode5_black_count_from_bd(uint8_t bd)
+{
+    int i, black_cnt;
+    black_cnt = 0;
+    for (i = 0; i < 8; i++) {
+        if (!(bd & (1u << i))) black_cnt++;  /* bit=0 是黑线 */
+    }
+    return black_cnt;
+}
+
+/* 判断是否是全白或近似全白（允许1个通道误判） */
+static int is_white_or_near_white_for_trace_c(uint8_t bd)
+{
+    int black_count;
+    if (bd == 0xFF) return 1;  /* 全白 */
+
+    black_count = mode5_black_count_from_bd(bd);
+    if (black_count <= 1) return 1;  /* 允许 1 个通道误判 */
+
+    return 0;
+}
+
+/* 判断是否是稳定的第二个半圆黑线（2-6个黑色通道） */
+static int is_stable_second_arc_black_line(uint8_t bd)
+{
+    int black_count;
+    black_count = mode5_black_count_from_bd(bd);
+
+    if (black_count >= TRACE_C_BLACK_MIN_CHANNELS &&
+        black_count <= TRACE_C_BLACK_MAX_CHANNELS) {
+        return 1;
+    }
+
+    return 0;
+}
+
+/* 检测当前是否有稳定黑线（不能太敏感，避免噪声误触发） */
+static int trace_c_has_stable_black_line(void)
+{
+    return is_stable_second_arc_black_line(mission_gray_bd);
+}
+
+/* 全白路段直行控制（纯 JY61P 航向保持）
+ * 调试说明：
+ *   - 如果偏右更严重，改 TRACE_C_WHITE_YAW_SIGN = -1
+ *   - 如果方向对但修正不够，增大 TRACE_C_WHITE_YAW_KP
+ *   - 如果整体慢慢偏右，调 TRACE_C_WHITE_STEER_OFFSET */
+static void mission_trace_c_white_drive(void)
+{
+    int err, yaw_turn, final_turn;
+    int left_target, right_target;
+
+    /* 计算 yaw 航向误差（处理 -180~180 跨界） */
+    err = yaw_angle_int - trace_c_yaw_ref;
+    while (err > 180) err -= 360;
+    while (err < -180) err += 360;
+
+    /* yaw 死区 */
+    if (err > -TRACE_C_WHITE_YAW_DEADBAND && err < TRACE_C_WHITE_YAW_DEADBAND) {
+        yaw_turn = 0;
+    } else {
+        yaw_turn = TRACE_C_WHITE_YAW_SIGN * TRACE_C_WHITE_YAW_KP * err;
+
+        /* 限幅 */
+        if (yaw_turn > TRACE_C_WHITE_YAW_MAX_TURN) {
+            yaw_turn = TRACE_C_WHITE_YAW_MAX_TURN;
+        }
+        if (yaw_turn < -TRACE_C_WHITE_YAW_MAX_TURN) {
+            yaw_turn = -TRACE_C_WHITE_YAW_MAX_TURN;
+        }
+    }
+
+    /* 合成最终转向（yaw + 偏移） */
+    final_turn = yaw_turn + TRACE_C_WHITE_STEER_OFFSET;
+
+    /* 内环：双轮速度 PID（唯一电机输出点） */
+    left_target = TRACE_C_WHITE_BASE_SPEED - final_turn;
+    right_target = TRACE_C_WHITE_BASE_SPEED + final_turn;
+
+    motorA.now = left_encoder;  motorA.target = left_target;
+    motorB.now = right_encoder; motorB.target = right_target;
+    pid_cal(&motorA); pid_cal(&motorB);
+    pid_out_limit(&motorA); pid_out_limit(&motorB);
+    Set_left_pwm((int)motorA.out);
+    Set_right_pwm((int)motorB.out);
+}
+
 /* ===================== 里程累计（25E：积分速度） ===================== */
 static void mission_odom_update(void)
 {
@@ -107,11 +285,19 @@ static int mission_transition_hit(void)
     if (nodata_was_high && mission_nodata <= MISSION_ARC_ENTER) {
         /* 由直道(丢线)进入弧(有线) */
         if (mission_dist - last_marker_dist >= MISSION_WP_MIN_GAP) {
-            last_marker_dist = mission_dist; hit = 1;
+            if (mission_state != TASK_TRACE_TO_C ||
+                mission_dist - trace_state_entry_dist >= MISSION_C_MIN_DIST_AFTER_STATE) {
+                last_marker_dist = mission_dist; hit = 1;
+            }
         }
         nodata_was_high = 0;
     } else if (!nodata_was_high && mission_nodata >= MISSION_ARC_EXIT) {
         /* 由弧(有线)回到直道(丢线) */
+#if MISSION_C_IGNORE_ARC_EXIT_HIT
+        if (mission_state == TASK_TRACE_TO_C) {
+            hit = 0;    /* C段中间全白只消耗跳变，不当作到达C点 */
+        } else
+#endif
         if (mission_dist - last_marker_dist >= MISSION_WP_MIN_GAP) {
             last_marker_dist = mission_dist; hit = 1;
         }
@@ -200,9 +386,13 @@ void mission_reset(void)
     mission_bias     = 0.0f;
     last_bias_sign   = 0;
     last_marker_dist = -1e9f;
+    trace_state_entry_dist = 0.0f;
     nodata_was_high  = 1;             /* 交界检测初始按"在直道"，第一段直道->弧 才算到 B */
     begin_protect_cnt = MISSION_BEGIN_PROTECT_TICKS;  /* 发车保护(24H) */
     stop_timer = 0; aim_timer = 0;
+    mission_debug_start_marker_done = 0;
+    mission_debug_start_timer = 0;
+    mission_debug_start_phase = 0;
 
     /* 清 PID 历史，避免上次残留导致起步抽搐 */
     line_pid.error[0] = line_pid.error[1] = line_pid.error[2] = 0;
@@ -232,6 +422,10 @@ void mission_run(void)
     /* 进入 mode5 后首拍自复位一次（也可在按键 set->1 时显式调 mission_reset） */
     if (!mission_armed) { mission_reset(); mission_armed = 1; }
 
+    if (mission_debug_start_marker_service()) {
+        return;
+    }
+
     mission_gray_update();
     mission_odom_update();
 
@@ -258,7 +452,7 @@ void mission_run(void)
         mission_drive(MISSION_SPEED_BASE);
         if (mission_waypoint_reached(MISSION_DIST_TO_B)) {
             mission_wp_count = 1;
-            beep();                       /* B 点提示 */
+            mission_beep_reason(BEEP_REASON_B_REACHED);  /* B 点提示 */
             stop_timer = MISSION_STOP_BEEP_TICKS;
             mission_state = TASK_STOP_AT_B;
         }
@@ -279,26 +473,78 @@ void mission_run(void)
         mission_stop();
         if (--aim_timer <= 0) {
             gimbal_center();              /* 收回云台（可按需保留瞄准姿态） */
+            trace_state_entry_dist = mission_dist;
+
+            /* 初始化 TRACE_TO_C white corridor guard */
+            trace_c_white_guard_active = 1;
+            trace_c_black_count = 0;
+            trace_c_yaw_ref = yaw_angle_int;  /* 记录当前 yaw 作为参考 */
+
+            /* 重置 nodata 状态，标记"进入白色直道" */
+            mission_nodata = 0xFF;
+            nodata_was_high = 1;  /* 标记为直道状态 */
+
             mission_state = TASK_TRACE_TO_C;
         }
         break;
 
     /* ---- 继续循迹 C ---- */
     case TASK_TRACE_TO_C:
+    {
+        uint8_t bd;
+
+        /* 读取当前灰度值（必须在最开头） */
+        bd = mission_gray_bd;
+
+        /* White corridor guard：全白路段保护逻辑（最高优先级） */
+        if (trace_c_white_guard_active) {
+            /* 判断是否是全白或近似全白 */
+            if (is_white_or_near_white_for_trace_c(bd)) {
+                /* 全白/近似全白：纯 JY61P 航向保持直行 */
+                mission_trace_c_white_drive();
+                /* 立即 break，跳过后续所有逻辑 */
+                break;
+            }
+
+            /* 判断是否检测到稳定的第二个半圆黑线 */
+            if (is_stable_second_arc_black_line(bd)) {
+                trace_c_black_count++;
+                if (trace_c_black_count >= TRACE_C_BLACK_COUNT_REQUIRED) {
+                    /* 连续检测到稳定黑线，退出 white guard */
+                    trace_c_white_guard_active = 0;
+                    trace_c_black_count = 0;
+                    /* 从下一轮开始让原逻辑接管 */
+                }
+            } else {
+                /* 不是稳定黑线，重置计数 */
+                trace_c_black_count = 0;
+            }
+
+            /* white guard active 期间，无论如何都用白色直行控制 */
+            mission_trace_c_white_drive();
+            /* 立即 break，禁止执行原逻辑 */
+            break;
+        }
+
+        /* 原来的 TASK_TRACE_TO_C 正常循迹逻辑（只有退出 white guard 后才执行） */
         mission_drive(MISSION_SPEED_BASE);
         if (mission_waypoint_reached(MISSION_DIST_TO_C)) {
-            mission_wp_count = 2;
-            beep();                       /* C 点提示 */
-            mission_state = TASK_TRACE_TO_D;
+            /* 禁止在 white guard active 时切换状态 */
+            if (!trace_c_white_guard_active) {
+                mission_wp_count = 2;
+                mission_beep_reason(BEEP_REASON_C_REACHED);  /* 使用新的包装函数 */
+                mission_state = TASK_TRACE_TO_D;
+            }
         }
-        break;
+    }
+    break;
 
     /* ---- 循迹 D ---- */
     case TASK_TRACE_TO_D:
         mission_drive(MISSION_SPEED_BASE);
         if (mission_waypoint_reached(MISSION_DIST_TO_D)) {
             mission_wp_count = 3;
-            beep();                       /* D 点提示 */
+            mission_beep_reason(BEEP_REASON_D_REACHED);  /* D 点提示 */
             mission_state = TASK_TRACE_TO_A;
         }
         break;
@@ -308,6 +554,7 @@ void mission_run(void)
         mission_drive(MISSION_SPEED_BASE);
         if (mission_waypoint_reached(MISSION_DIST_TO_A)) {
             mission_wp_count = 4;
+            mission_beep_reason(BEEP_REASON_A_REACHED);  /* A 点提示 */
             stop_timer = MISSION_STOP_BEEP_TICKS;
             mission_state = TASK_FINISH;
         }
@@ -317,7 +564,7 @@ void mission_run(void)
     case TASK_FINISH:
         mission_stop();
         if (stop_timer > 0) {             /* 进入时响一次，之后保持安静停车 */
-            if (stop_timer == MISSION_STOP_BEEP_TICKS) beep();
+            if (stop_timer == MISSION_STOP_BEEP_TICKS) mission_beep_reason(BEEP_REASON_FINISH);
             stop_timer--;
         }
         break;

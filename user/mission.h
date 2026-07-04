@@ -79,6 +79,8 @@ int mission_gray_mapped(int logic_idx);
 #define MISSION_ARC_ENTER     0x20     /* 低于它=确信有线 */
 #define MISSION_ARC_EXIT      0x40     /* 高于它=确信丢线 */
 #define MISSION_WP_MIN_GAP    200.0f   /* 两次关键点最小里程间隔，防同一交界抖动重复计数 */
+#define MISSION_C_IGNORE_ARC_EXIT_HIT   1     /* mode5 C段忽略 arc->straight 误触发 */
+#define MISSION_C_MIN_DIST_AFTER_STATE  0.0f  /* C段进入后相对里程保护，默认不额外限制 */
 
 /* 纯距离模式下，A 起点到 B/C/D/A 的累计里程（里程单位 = mm 或自定，需标定） */
 #define MISSION_DIST_TO_B   600.0f
@@ -96,6 +98,35 @@ int mission_gray_mapped(int logic_idx);
 #define MISSION_LOST_FORCE_TURN      50    /* 弯道丢线时强制差速找线（符号见实现） */
 #define MISSION_GIMBAL_AIM_TICKS     300   /* 云台瞄准停留 300*10ms=3s（≤5s 规则内） */
 #define MISSION_STOP_BEEP_TICKS      50    /* 到点停车提示时长 */
+
+/* ===================== 5.5. TASK_TRACE_TO_C 中间全白路段保护（white corridor guard） ===================== */
+/* 目的：防止第一个半圆出来后，在中间全白路段误触发 C 点，导致右拐冲出赛道。
+ * 原理：在 TRACE_TO_C 状态中，如果检测到全白路段，则启用保护，只允许低速直行/JY61P yaw保持，
+ *       禁止触发 waypoint、禁止状态切换、禁止普通丢线右转逻辑，直到稳定检测到第二个半圆黑线。 */
+#define TRACE_C_BLACK_COUNT_REQUIRED  5     /* 连续检测到黑线 N 次才退出 white guard */
+#define TRACE_C_BLACK_MIN_CHANNELS    2     /* 稳定黑线：最少黑色通道数 */
+#define TRACE_C_BLACK_MAX_CHANNELS    6     /* 稳定黑线：最多黑色通道数 */
+#define TRACE_C_WHITE_BASE_SPEED      MISSION_SPEED_SLOW  /* 全白段低速直行 */
+#define TRACE_C_WHITE_YAW_KP          3     /* 全白段 yaw 修正增益 */
+#define TRACE_C_WHITE_YAW_MAX_TURN    180   /* 全白段 yaw 修正最大差速 */
+#define TRACE_C_WHITE_YAW_DEADBAND    2     /* 全白段 yaw 误差死区（度） */
+#define TRACE_C_WHITE_YAW_SIGN        1     /* 全白段 yaw 修正方向，反了改 -1 */
+#define TRACE_C_WHITE_STEER_OFFSET    0     /* 全白段转向偏移 */
+
+/* ===================== 5.6. 蜂鸣器触发原因诊断 ===================== */
+#define BEEP_REASON_B_REACHED         1     /* 到达 B 点 */
+#define BEEP_REASON_C_REACHED         2     /* 到达 C 点 */
+#define BEEP_REASON_D_REACHED         3     /* 到达 D 点 */
+#define BEEP_REASON_A_REACHED         4     /* 到达 A 点 */
+#define BEEP_REASON_FINISH            5     /* 任务完成 */
+#define BEEP_REASON_UNKNOWN           9     /* 未知原因 */
+
+/* 调试选项：TRACE_TO_C 中如果触发 beep，立即停车（不继续右拐） */
+#define MISSION_DEBUG_STOP_ON_BEEP_IN_TRACE_C  1
+
+/* 临时固件运行硬验证：mode5 set=1 后先停车约2秒，并做两次声光提示 */
+#define MISSION_DEBUG_START_MARKER_ENABLE      1
+#define MISSION_DEBUG_START_MARKER_TICKS       200   /* 200*10ms = 2s */
 
 /* ===================== 任务状态机 ===================== */
 typedef enum {

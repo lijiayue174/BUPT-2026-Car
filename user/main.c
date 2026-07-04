@@ -168,6 +168,10 @@ static int mode3_current_pitch_us = GIMBAL_CENTER_PITCH_US;
 #define TASK1_ARC_LOST_TICKS      25      /* 0.25s all-white after arc means arc finished */
 #define TASK3_ARC_MIN_TICKS       140     /* mode5: ignore short all-white gaps inside the first curve */
 #define TASK3_ARC_LOST_TICKS      50      /* mode5: require 0.5s all-white before ending an arc */
+#define MODE5_DEBUG_ENTRY_MARKER_ENABLE 1
+#define MODE5_DEBUG_ENTRY_MARKER_TICKS  200  /* 200 * 10ms = 2s */
+#define TASK3_CD_STRAIGHT_FINAL_YAW    0     /* reuse first-straight yaw target after the first arc */
+#define TASK3_CD_STRAIGHT_YAW_STEP     1     /* ramp target 1 degree per 10ms instead of snapping to 0 */
 #define YAW_STRAIGHT_GAIN         180     /* PWM correction per yaw degree */
 #define YAW_STRAIGHT_MAX          2400    /* max left/right PWM correction */
 #define YAW_STRAIGHT_DEADBAND     3       /* allow -3..+3 deg on straight without twitching */
@@ -230,6 +234,8 @@ static uint8_t task3_arc_seen_line = 0;
 static uint8_t task3_arc_aligning = 0;
 static uint8_t task3_finished = 0;
 static int task3_straight_yaw_target = 0;
+static uint8_t mode5_debug_marker_done = 0;
+static uint16_t mode5_debug_marker_timer = 0;
 static int yaw_straight_last_error_sign = 0;
 static int yaw_straight_same_sign_count = 0;
 
@@ -410,6 +416,34 @@ static void motor_output_both(int left_pwm, int right_pwm)
     motor_output_right(right_pwm);
 }
 
+static int mode5_debug_entry_marker_run(void)
+{
+#if MODE5_DEBUG_ENTRY_MARKER_ENABLE
+    if (mode5_debug_marker_done) {
+        return 0;
+    }
+
+    mode5_motor_output_both(0, 0);
+    OLED_ShowString(1, 1, "M5DBG   ");
+    OLED_ShowString(2, 1, "ENTRY   ");
+
+    if (mode5_debug_marker_timer == 20) {
+        beep();
+    } else if (mode5_debug_marker_timer == 100) {
+        beep();
+    }
+
+    mode5_debug_marker_timer++;
+    if (mode5_debug_marker_timer >= MODE5_DEBUG_ENTRY_MARKER_TICKS) {
+        mode5_debug_marker_done = 1;
+    }
+
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 /* ============================================================================
  *  car_stop_all() —— 统一安全停止函数
  * ----------------------------------------------------------------------------
@@ -518,6 +552,8 @@ static void task3_reset(void)
 {
     motor_test_reset();
     task3_clear_state();
+    mode5_debug_marker_done = 0;
+    mode5_debug_marker_timer = 0;
 }
 
 static int line_test_limit_pwm(int pwm)
@@ -984,8 +1020,11 @@ static void task3_next_phase(task3_phase_t next_phase)
     task3_arc_seen_line = 0;
     task3_arc_aligning = 0;
     line_lost_count = 0;
-    if (next_phase == TASK3_AB_STRAIGHT || next_phase == TASK3_CD_STRAIGHT) {
+    if (next_phase == TASK3_AB_STRAIGHT) {
         task3_straight_yaw_target = 0;
+        yaw_straight_adapt_reset();
+    } else if (next_phase == TASK3_CD_STRAIGHT) {
+        task3_straight_yaw_target = yaw_relative_int();
         yaw_straight_adapt_reset();
     }
 }
@@ -1002,6 +1041,20 @@ static void task3_finish(void)
 
 static void task3_drive_straight(void)
 {
+    if (task3_phase == TASK3_CD_STRAIGHT) {
+        if (task3_straight_yaw_target < TASK3_CD_STRAIGHT_FINAL_YAW) {
+            task3_straight_yaw_target += TASK3_CD_STRAIGHT_YAW_STEP;
+            if (task3_straight_yaw_target > TASK3_CD_STRAIGHT_FINAL_YAW) {
+                task3_straight_yaw_target = TASK3_CD_STRAIGHT_FINAL_YAW;
+            }
+        } else if (task3_straight_yaw_target > TASK3_CD_STRAIGHT_FINAL_YAW) {
+            task3_straight_yaw_target -= TASK3_CD_STRAIGHT_YAW_STEP;
+            if (task3_straight_yaw_target < TASK3_CD_STRAIGHT_FINAL_YAW) {
+                task3_straight_yaw_target = TASK3_CD_STRAIGHT_FINAL_YAW;
+            }
+        }
+    }
+
     yaw_drive_straight(task3_straight_yaw_target);
 }
 
@@ -1060,9 +1113,14 @@ static void task3_run_arc(task3_phase_t next_phase)
     }
 
     if (task3_arc_lost_ticks >= TASK3_ARC_LOST_TICKS) {
-        beep();
-        task3_arc_aligning = 1;
-        task3_arc_align_ticks = 0;
+        if (next_phase == TASK3_CD_STRAIGHT) {
+            beep();
+            task3_next_phase(next_phase);
+        } else {
+            beep();
+            task3_arc_aligning = 1;
+            task3_arc_align_ticks = 0;
+        }
     }
 }
 
@@ -1157,7 +1215,14 @@ int main(void)
 
     while (1)
 	 {
-		   if (!(mode==5 && set==1)) mission_disarm();   /* ????? mode5,???????? */
+		   if (!(mode==5 && set==1)) {
+             mission_disarm();   /* ????? mode5,???????? */
+             if (mode==5 && set==0) {
+                 mode5_debug_marker_done = 0;
+                 mode5_debug_marker_timer = 0;
+                 car_stop_all();
+             }
+         }
 			 if(imu_flag)
 			{
 				imu_flag=0;
@@ -1265,7 +1330,9 @@ void TIMG8_IRQHandler()
 		   }
 			  if(mode==5&&set==1)          /* ??:????????? */
        {
-          task3_run_once();
+          if (!mode5_debug_entry_marker_run()) {
+              task3_run_once();
+          }
        }
 
         /* mode 6 临时测试：阶段3电机测试 / 阶段4低速循迹测试 */

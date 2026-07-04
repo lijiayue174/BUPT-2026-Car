@@ -156,6 +156,30 @@ static int mode3_current_pitch_us = GIMBAL_CENTER_PITCH_US;
 
 #define MODE3_AIM_STEP_US        10       /* smooth 10us per 10ms tick, avoids startup kick */
 
+/* ==================== mode4: static gimbal drawing test, capital L ==================== */
+#define MODE4_L_STEP_US          10       /* 10us per 10ms tick, smooth servo movement */
+#define MODE4_L_PITCH_DELTA_US   300      /* vertical stroke length; tune on the target surface */
+#define MODE4_L_YAW_DELTA_US     300      /* horizontal stroke length; tune on the target surface */
+#define MODE4_L_PITCH_SIGN       1        /* change to -1 if vertical stroke goes the wrong way */
+#define MODE4_L_YAW_SIGN         1        /* change to -1 if horizontal stroke goes the wrong way */
+#define MODE4_L_GAP_TICKS        50       /* about 1s between pitch stroke and yaw stroke */
+
+#define MODE4_DRAW_IDLE         0
+#define MODE4_DRAW_PITCH        1
+#define MODE4_DRAW_WAIT         2
+#define MODE4_DRAW_YAW          3
+#define MODE4_DRAW_DONE         4
+
+static int mode4_draw_state = MODE4_DRAW_IDLE;
+static uint8_t mode4_draw_started = 0;
+static int mode4_gap_ticks = 0;
+static int mode4_start_yaw_us = GIMBAL_CENTER_YAW_US;
+static int mode4_start_pitch_us = GIMBAL_CENTER_PITCH_US;
+static int mode4_current_yaw_us = GIMBAL_CENTER_YAW_US;
+static int mode4_current_pitch_us = GIMBAL_CENTER_PITCH_US;
+static int mode4_target_yaw_us = GIMBAL_CENTER_YAW_US;
+static int mode4_target_pitch_us = GIMBAL_CENTER_PITCH_US;
+
 /* ==================== mode2: 校赛任务一，顺时针 A-B-C-D-A ==================== */
 #define TASK1_COUNT_TO_DIST       0.20f   /* same odom scale as mission.c, tune on site if distance is off */
 #define TASK1_STRAIGHT_DIST_MM    1000.0f /* A-B and C-D straight section, 100cm */
@@ -974,13 +998,104 @@ static void mode3_aim_run(void)
         mode3_aim_prepare();
     }
 
+    /*
+     * mode3 independent aiming: reverse the 0->1 servo movement around center.
+     * The final pulse still goes through gimbal_set_pulse_us() safety clamps.
+     */
     mode3_current_yaw_us = mode3_step_to_target(mode3_current_yaw_us,
-        GIMBAL_AIM_B_YAW_US);
+        (GIMBAL_CENTER_YAW_US * 2 - GIMBAL_AIM_B_YAW_US));
     mode3_current_pitch_us = mode3_step_to_target(mode3_current_pitch_us,
-        GIMBAL_AIM_B_PITCH_US);
+        (GIMBAL_CENTER_PITCH_US * 2 - GIMBAL_AIM_B_PITCH_US));
 
     gimbal_set_pulse_us((uint16_t)mode3_current_yaw_us,
         (uint16_t)mode3_current_pitch_us);
+}
+
+static int mode4_step_to_target(int current, int target)
+{
+    if (current < target) {
+        current += MODE4_L_STEP_US;
+        if (current > target) current = target;
+    } else if (current > target) {
+        current -= MODE4_L_STEP_US;
+        if (current < target) current = target;
+    }
+    return current;
+}
+
+static void mode4_draw_reset(void)
+{
+    mode4_draw_started = 0;
+    mode4_draw_state = MODE4_DRAW_IDLE;
+    mode4_gap_ticks = 0;
+    mode4_start_yaw_us = gimbal_yaw_us_now;
+    mode4_start_pitch_us = gimbal_pitch_us_now;
+    mode4_current_yaw_us = mode4_start_yaw_us;
+    mode4_current_pitch_us = mode4_start_pitch_us;
+    mode4_target_yaw_us = mode4_start_yaw_us;
+    mode4_target_pitch_us = mode4_start_pitch_us;
+}
+
+static void mode4_draw_prepare(void)
+{
+    mode4_draw_started = 1;
+    mode4_draw_state = MODE4_DRAW_PITCH;
+    mode4_gap_ticks = 0;
+
+    /*
+     * mode3 set=0 is the field-calibrated starting point. Capture the current
+     * gimbal pulse widths and draw an L from there: pitch stroke first, yaw
+     * stroke second. Flip MODE4_L_*_SIGN if either stroke direction is wrong.
+     */
+    mode4_start_yaw_us = gimbal_yaw_us_now;
+    mode4_start_pitch_us = gimbal_pitch_us_now;
+    mode4_current_yaw_us = mode4_start_yaw_us;
+    mode4_current_pitch_us = mode4_start_pitch_us;
+    mode4_target_yaw_us = mode4_start_yaw_us;
+    mode4_target_pitch_us =
+        mode4_start_pitch_us + MODE4_L_PITCH_SIGN * MODE4_L_PITCH_DELTA_US;
+
+    gimbal_set_pulse_us((uint16_t)mode4_current_yaw_us,
+        (uint16_t)mode4_current_pitch_us);
+}
+
+static void mode4_draw_run(void)
+{
+    motor_output_both(0, 0);
+
+    if (!mode4_draw_started) {
+        mode4_draw_prepare();
+    }
+
+    if (mode4_draw_state == MODE4_DRAW_PITCH) {
+        mode4_current_pitch_us = mode4_step_to_target(mode4_current_pitch_us,
+            mode4_target_pitch_us);
+        gimbal_set_pitch_us((uint16_t)mode4_current_pitch_us);
+        if (mode4_current_pitch_us == mode4_target_pitch_us) {
+            mode4_draw_state = MODE4_DRAW_WAIT;
+            mode4_gap_ticks = MODE4_L_GAP_TICKS;
+        }
+    } else if (mode4_draw_state == MODE4_DRAW_WAIT) {
+        gimbal_set_pulse_us((uint16_t)mode4_current_yaw_us,
+            (uint16_t)mode4_current_pitch_us);
+        if (mode4_gap_ticks > 0) {
+            mode4_gap_ticks--;
+        } else {
+            mode4_draw_state = MODE4_DRAW_YAW;
+            mode4_target_yaw_us =
+                mode4_start_yaw_us + MODE4_L_YAW_SIGN * MODE4_L_YAW_DELTA_US;
+        }
+    } else if (mode4_draw_state == MODE4_DRAW_YAW) {
+        mode4_current_yaw_us = mode4_step_to_target(mode4_current_yaw_us,
+            mode4_target_yaw_us);
+        gimbal_set_yaw_us((uint16_t)mode4_current_yaw_us);
+        if (mode4_current_yaw_us == mode4_target_yaw_us) {
+            mode4_draw_state = MODE4_DRAW_DONE;
+        }
+    } else {
+        gimbal_set_pulse_us((uint16_t)mode4_current_yaw_us,
+            (uint16_t)mode4_current_pitch_us);
+    }
 }
 
 static void task3_odom_update(void)
@@ -1177,6 +1292,28 @@ static void task3_run_once(void)
     }
 }
 
+static void gimbal_soft_pwm_background(void)
+{
+    if (mode==3) {
+        gimbal_pitch_soft_pwm_service();
+        return;
+    }
+    if (mode==4 && set==1) {
+        mode4_draw_run();
+        gimbal_pitch_soft_pwm_service();
+        return;
+    }
+    if (mode==7 && set==1) {
+        gimbal_pitch_soft_pwm_service();
+        return;
+    }
+    if (mode==5 && set==1) {
+        if (task3_phase==TASK3_B_AIM || task3_phase==TASK3_C_AIM) {
+            gimbal_pitch_soft_pwm_service();
+        }
+    }
+}
+
 /* ============================================================================
  *  main() 和 TIMG8 ISR
  * ========================================================================== */
@@ -1271,16 +1408,7 @@ int main(void)
 			 }
 		 }
 
-          /*
-           * PA16 pitch uses software PWM. Run one 20ms frame only while the car
-           * is stopped for aiming/test phases; never block inside TIMG8 ISR.
-           */
-          if ((mode==3) ||
-              (mode==7 && set==1) ||
-              (mode==5 && set==1 &&
-               (task3_phase==TASK3_B_AIM || task3_phase==TASK3_C_AIM))) {
-              gimbal_pitch_soft_pwm_service();
-          }
+          gimbal_soft_pwm_background();
 
 		  /* 统一调试显示（所有 mode 1~7 格式一致，不随 mode 变化） */
 		  oled_debug_update();
@@ -1308,7 +1436,7 @@ void TIMG8_IRQHandler()
 		   }
 			 	if(mode==4&&set==1)
 		   {
-          track4();
+          motor_output_both(0, 0);
 		   }
 			  if(mode==5&&set==1)          /* ??:????????? */
        {
